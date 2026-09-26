@@ -1,3 +1,4 @@
+# mne skazali chto mozno
 import asyncio
 import logging
 import sqlite3
