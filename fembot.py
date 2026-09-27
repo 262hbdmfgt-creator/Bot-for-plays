@@ -1,4 +1,3 @@
-# mne skazali chto mozno
 import asyncio
 import logging
 import sqlite3
@@ -6,10 +5,9 @@ import random
 import string
 import os
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandObject, BaseFilter
+from aiogram.filters import Command, BaseFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -23,21 +21,21 @@ from aiogram.types import (
 )
 
 # ----------------------------------------------------------------------
-# CONFIGURATION
+# КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (RAILWAY)
 # ----------------------------------------------------------------------
 API_TOKEN = os.getenv("BOT_TOKEN")
 SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0"))
 DB_NAME = os.getenv("DB_PATH", "fembot_database.db")
 
-# Safety directory check for database
+# Создаем папку для базы данных, если она указана (например, /data/)
 db_dir = os.path.dirname(DB_NAME)
 if db_dir:
     os.makedirs(db_dir, exist_ok=True)
 
-# Logging configuration
+# Логирование
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Rarity settings
+# Веса редкости для генерации фото (в процентах)
 RARITIES_WEIGHTS = {
     "редкое": 40,
     "ультра редкое": 25,
@@ -47,6 +45,7 @@ RARITIES_WEIGHTS = {
     "редчайший фем": 2
 }
 
+# Порядок сортировки в коллекции (1 — самое редкое, 6 — менее редкое)
 RARITY_ORDER = {
     "редчайший фем": 1,
     "фембойский артефакт": 2,
@@ -56,10 +55,11 @@ RARITY_ORDER = {
     "редкое": 6
 }
 
+# Аватар по умолчанию, если у пользователя нет фото профиля
 DEFAULT_AVATAR = "https://placehold.co/600x600/png?text=No+Avatar"
 
 # ----------------------------------------------------------------------
-# DATABASE ENGINE
+# РАБОТА С БАЗОЙ ДАННЫХ SQLite
 # ----------------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -108,7 +108,7 @@ def init_db():
             value TEXT
         )
     ''')
-    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('admin_info', 'ÐÐ´Ð¼Ð¸Ð½Ð¸ÑÑÑÐ°ÑÐ¸Ñ ÐµÑÐµ Ð½Ðµ Ð½Ð°ÑÑÑÐ¾Ð¸Ð»Ð° ÑÑÐ¾Ñ ÑÐµÐºÑÑ. ÐÑÐ¿Ð¾Ð»ÑÐ·ÑÐ¹ÑÐµ FSM Ð´Ð»Ñ ÐµÐ³Ð¾ Ð¸Ð·Ð¼ÐµÐ½ÐµÐ½Ð¸Ñ.')")
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('admin_info', 'Администрация еще не настроила этот текст. Используйте /set_admin_text для его изменения.')")
     
     if SUPER_ADMIN_ID != 0:
         cursor.execute("INSERT OR IGNORE INTO users (user_id, username, is_admin) VALUES (?, ?, 1)", (SUPER_ADMIN_ID, "SuperAdmin"))
@@ -150,7 +150,7 @@ def is_admin_user(user_id: int) -> bool:
     return bool(res and res[0] == 1)
 
 # ----------------------------------------------------------------------
-# FSM STATES
+# СТЕЙТЫ FSM И ФИЛЬТРЫ
 # ----------------------------------------------------------------------
 class AdminStates(StatesGroup):
     waiting_for_photo = State()
@@ -164,10 +164,11 @@ class IsAdminFilter(BaseFilter):
     async def __call__(self, message: Message) -> bool:
         return is_admin_user(message.from_user.id)
 
-# Bot & Dispatcher setup
+# Инициализация бота
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# Отслеживание добавления/удаления бота из чатов
 @dp.my_chat_member()
 async def on_my_chat_member(update: types.ChatMemberUpdated):
     chat_id = update.chat.id
@@ -177,6 +178,7 @@ async def on_my_chat_member(update: types.ChatMemberUpdated):
     elif update.new_chat_member.status in ["left", "kicked"]:
         execute_query("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
 
+# Глобальный обработчик текста для триггеров и регистрации
 @dp.message(F.text)
 async def global_message_handler(message: Message, state: FSMContext):
     register_user_and_chat(
@@ -186,15 +188,20 @@ async def global_message_handler(message: Message, state: FSMContext):
         chat_type=message.chat.type
     )
     text_lower = message.text.lower().strip()
-    if text_lower == "ÑÐµÐ¼":
+    if text_lower == "фем":
         await handle_foto_cmd(message)
-    elif text_lower == "Ð¿ÑÐ¾ÑÐ¸Ð»Ñ":
+    elif text_lower == "профиль":
         await handle_profile_cmd(message)
-    elif text_lower == "ÐºÑÐ¾ Ð°Ð´Ð¼Ð¸Ð½":
+    elif text_lower == "кто админ":
         await handle_admin_info_cmd(message)
     else:
         await dp.propagate_event(update=message.by_custom_key, message=message, state=state)
 
+# ----------------------------------------------------------------------
+# ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ
+# ----------------------------------------------------------------------
+
+# 1) Команда /foto
 @dp.message(Command("foto"))
 async def handle_foto_cmd(message: Message):
     user_id = message.from_user.id
@@ -212,7 +219,7 @@ async def handle_foto_cmd(message: Message):
             hours, remainder = divmod(remaining.seconds, 3600)
             minutes, seconds = divmod(remainder, 60)
             await message.reply(
-                f"â³ ÐÑ ÑÐ¶Ðµ Ð±ÑÐ°Ð»Ð¸ ÑÐ¾ÑÐ¾! ÐÐ¾Ð¿ÑÐ¾Ð±ÑÐ¹ÑÐµ ÑÐ½Ð¾Ð²Ð° ÑÐµÑÐµÐ·:\n*{hours:02d}:{minutes:02d}:{seconds:02d}*.",
+                f"⏳ Вы уже брали фото! Попробуйте снова через:\n*{hours:02d}:{minutes:02d}:{seconds:02d}*.",
                 parse_mode="Markdown"
             )
             return
@@ -225,7 +232,7 @@ async def handle_foto_cmd(message: Message):
     if not photos:
         photos = execute_query("SELECT id, file_id, rarity, description FROM photos ORDER BY RANDOM() LIMIT 1", fetchall=True)
         if not photos:
-            await message.reply("ð Ð Ð±Ð°Ð·Ðµ Ð¿Ð¾ÐºÐ° Ð½ÐµÑ ÑÐ¾ÑÐ¾. ÐÐ±ÑÐ°ÑÐ¸ÑÐµÑÑ Ðº Ð°Ð´Ð¼Ð¸Ð½Ð°Ð¼.")
+            await message.reply("😔 В базе пока нет фото. Обратитесь к администраторам.")
             return
         photo_id, file_id, real_rarity, description = photos[0]
         chosen_rarity = real_rarity
@@ -235,9 +242,10 @@ async def handle_foto_cmd(message: Message):
     execute_query("INSERT OR IGNORE INTO user_photos (user_id, photo_id) VALUES (?, ?)", (user_id, photo_id))
     execute_query("UPDATE users SET last_foto_time = ? WHERE user_id = ?", (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
     
-    caption = f"ð *ÐÑ Ð¿Ð¾Ð»ÑÑÐ¸Ð»Ð¸ Ð½Ð¾Ð²Ð¾Ðµ ÑÐ¾ÑÐ¾!*\n\nâ­ *Ð ÐµÐ´ÐºÐ¾ÑÑÑ:* {chosen_rarity.capitalize()}\nð *ÐÐ¿Ð¸ÑÐ°Ð½Ð¸Ðµ:* {description}"
+    caption = f"🎉 *Вы получили новое фото!*\n\n⭐ *Редкость:* {chosen_rarity.capitalize()}\n📝 *Описание:* {description}"
     await bot.send_photo(chat_id=message.chat.id, photo=file_id, caption=caption, parse_mode="Markdown")
 
+# 2) Команда /profil
 @dp.message(Command("profil"))
 async def handle_profile_cmd(message: Message):
     user_id = message.from_user.id
@@ -252,12 +260,13 @@ async def handle_profile_cmd(message: Message):
         if user_profile_photos.total_count > 0:
             avatar_url = user_profile_photos.photos[0][-1].file_id
     except Exception as e:
-        logging.warning(f"ÐÑÐ¸Ð±ÐºÐ° Ð°Ð²Ð°ÑÐ°ÑÐ°: {e}")
+        logging.warning(f"Ошибка получения аватара: {e}")
 
-    caption = f"ð¤ *ÐÐ°Ñ ÐÑÐ¾ÑÐ¸Ð»Ñ:*\n\nð· *ÐÐ¼Ñ:* {message.from_user.full_name}\nð¦ *ÐÐ°ÑÐ° ÐºÐ¾Ð»Ð»ÐµÐºÑÐ¸Ñ:* {user_photos_count} Ð¸Ð· {total_photos_count} ÑÐ¾ÑÐ¾.\n"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="ð¼ Ð¡Ð¼Ð¾ÑÑÐµÑÑ Ð²ÑÐµ ÑÐ¾ÑÐ¾", callback_data="view_collection:0")]])
+    caption = f"👤 *Ваш Профиль:*\n\n🏷 *Имя:* {message.from_user.full_name}\n📦 *Ваша коллекция:* {user_photos_count} из {total_photos_count} фото.\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🖼 Смотреть все фото", callback_data="view_collection:0")]])
     await message.reply_photo(photo=avatar_url, caption=caption, reply_markup=keyboard, parse_mode="Markdown")
 
+# Навигация по коллекции
 @dp.callback_query(F.data.startswith("view_collection:"))
 async def view_collection_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -268,7 +277,7 @@ async def view_collection_callback(callback: CallbackQuery):
         (user_id,), fetchall=True
     )
     if not user_photos:
-        await callback.answer("ð¢ Ð£ Ð²Ð°Ñ Ð¿Ð¾ÐºÐ° Ð½ÐµÑ Ð½Ð¸ Ð¾Ð´Ð½Ð¾Ð³Ð¾ ÑÐ¾ÑÐ¾ Ð² ÐºÐ¾Ð»Ð»ÐµÐºÑÐ¸Ð¸!", show_alert=True)
+        await callback.answer("😢 У вас пока нет ни одного фото в коллекции!", show_alert=True)
         return
         
     sorted_photos = sorted(user_photos, key=lambda x: RARITY_ORDER.get(x[2].lower(), 99))
@@ -276,17 +285,17 @@ async def view_collection_callback(callback: CallbackQuery):
     index = max(0, min(index, total_photos - 1))
     
     photo_id, file_id, rarity, description = sorted_photos[index]
-    caption = f"ð¼ *ÐÐ°ÑÐ° ÐÐ¾Ð»Ð»ÐµÐºÑÐ¸Ñ* ({index + 1} Ð¸Ð· {total_photos})\n\nâ­ *Ð ÐµÐ´ÐºÐ¾ÑÑÑ:* {rarity.capitalize()}\nð *ÐÐ¿Ð¸ÑÐ°Ð½Ð¸Ðµ:* {description}"
+    caption = f"🖼 *Ваша Коллекция* ({index + 1} из {total_photos})\n\n⭐ *Редкость:* {rarity.capitalize()}\n📝 *Описание:* {description}"
     
     buttons = []
     nav_row = []
     if index > 0:
-        nav_row.append(InlineKeyboardButton(text="â¬ï¸ ÐÑÐµÐ´.", callback_data=f"view_collection:{index - 1}"))
+        nav_row.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"view_collection:{index - 1}"))
     if index < total_photos - 1:
-        nav_row.append(InlineKeyboardButton(text="Ð¡Ð»ÐµÐ´. â¡ï¸", callback_data=f"view_collection:{index + 1}"))
+        nav_row.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"view_collection:{index + 1}"))
     if nav_row:
         buttons.append(nav_row)
-    buttons.append([InlineKeyboardButton(text="ð¤ ÐÐµÑÐ½ÑÑÑÑÑ Ð² Ð¿ÑÐ¾ÑÐ¸Ð»Ñ", callback_data="back_to_profile")])
+    buttons.append([InlineKeyboardButton(text="👤 Вернуться в профиль", callback_data="back_to_profile")])
     
     await callback.message.edit_media(media=InputMediaPhoto(media=file_id, caption=caption, parse_mode="Markdown"), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -304,57 +313,64 @@ async def back_to_profile_callback(callback: CallbackQuery):
     except Exception:
         pass
 
-    caption = f"ð¤ *ÐÐ°Ñ ÐÑÐ¾ÑÐ¸Ð»Ñ:*\n\nð· *ÐÐ¼Ñ:* {callback.from_user.full_name}\nð¦ *ÐÐ°ÑÐ° ÐºÐ¾Ð»Ð»ÐµÐºÑÐ¸Ñ:* {user_photos_count} Ð¸Ð· {total_photos_count} ÑÐ¾ÑÐ¾.\n"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="ð¼ Ð¡Ð¼Ð¾ÑÑÐµÑÑ Ð²ÑÐµ ÑÐ¾ÑÐ¾", callback_data="view_collection:0")]])
+    caption = f"👤 *Ваш Профиль:*\n\n🏷 *Имя:* {callback.from_user.full_name}\n📦 *Ваша коллекция:* {user_photos_count} из {total_photos_count} фото.\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🖼 Смотреть все фото", callback_data="view_collection:0")]])
     await callback.message.edit_media(media=InputMediaPhoto(media=avatar_url, caption=caption, parse_mode="Markdown"), reply_markup=keyboard)
 
+# 3) Команда /admin
 @dp.message(Command("admin"))
 async def handle_admin_info_cmd(message: Message):
     register_user_and_chat(message.from_user.id, message.from_user.username or "Unknown", message.chat.id, message.chat.type)
     admin_info = execute_query("SELECT value FROM settings WHERE key = 'admin_info'", fetchone=True)
-    await message.reply(admin_info[0] if admin_info else "ÐÐ´Ð¼Ð¸Ð½Ð¸ÑÑÑÐ°ÑÐ¸Ñ Ð½Ðµ Ð½Ð°ÑÑÑÐ¾ÐµÐ½Ð°.")
+    await message.reply(admin_info[0] if admin_info else "Администрация не настроена.")
 
-# ADMIN COMMANDS
+# ----------------------------------------------------------------------
+# АДМИНИСТРАТИВНЫЕ КОМАНДЫ
+# ----------------------------------------------------------------------
+
+# Изменение текста /admin
 @dp.message(Command("set_admin_text"), IsAdminFilter())
 async def set_admin_text_start(message: Message, state: FSMContext):
-    await message.reply("ÐÑÐ¿ÑÐ°Ð²ÑÑÐµ Ð½Ð¾Ð²ÑÐ¹ ÑÐµÐºÑÑ Ð´Ð»Ñ ÐºÐ¾Ð¼Ð°Ð½Ð´Ñ /admin:")
+    await message.reply("Отправьте новый текст для команды /admin:")
     await state.set_state(AdminStates.waiting_for_admin_text)
 
 @dp.message(AdminStates.waiting_for_admin_text, IsAdminFilter())
 async def set_admin_text_save(message: Message, state: FSMContext):
     execute_query("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_info', ?)", (message.text,))
-    await message.reply("â Ð¡Ð¾Ð¾Ð±ÑÐµÐ½Ð¸Ðµ Ð¸Ð·Ð¼ÐµÐ½ÐµÐ½Ð¾!")
+    await message.reply("✅ Сообщение администрации успешно изменено!")
     await state.clear()
 
+# 1) Команда /plus_foto
 @dp.message(Command("plus_foto"), IsAdminFilter())
 async def plus_foto_start(message: Message, state: FSMContext):
-    await message.reply("ð¸ ÐÑÐ¿ÑÐ°Ð²ÑÑÐµ ÑÐ¾ÑÐ¾Ð³ÑÐ°ÑÐ¸Ñ:")
+    await message.reply("📸 Отправьте фотографию, которую хотите добавить в базу:")
     await state.set_state(AdminStates.waiting_for_photo)
 
 @dp.message(AdminStates.waiting_for_photo, IsAdminFilter(), F.photo)
 async def plus_foto_photo(message: Message, state: FSMContext):
     await state.update_data(file_id=message.photo[-1].file_id)
     buttons = [[InlineKeyboardButton(text=r.capitalize(), callback_data=f"set_rarity:{r}")] for r in RARITIES_WEIGHTS.keys()]
-    await message.reply("â¨ ÐÑÐ±ÐµÑÐ¸ÑÐµ ÑÐµÐ´ÐºÐ¾ÑÑÑ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await message.reply("✨ Выберите редкость для этого фото:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await state.set_state(AdminStates.waiting_for_rarity)
 
 @dp.callback_query(AdminStates.waiting_for_rarity, F.data.startswith("set_rarity:"), IsAdminFilter())
 async def plus_foto_rarity(callback: CallbackQuery, state: FSMContext):
     rarity = callback.data.split(":")[1]
     await state.update_data(rarity=rarity)
-    await callback.message.edit_text(f"Ð ÐµÐ´ÐºÐ¾ÑÑÑ: *{rarity.capitalize()}*. ÐÑÐ¿ÑÐ°Ð²ÑÑÐµ Ð¾Ð¿Ð¸ÑÐ°Ð½Ð¸Ðµ Ðº ÑÐ¾ÑÐ¾:", parse_mode="Markdown")
+    await callback.message.edit_text(f"Вы выбрали редкость: *{rarity.capitalize()}*.\nТеперь отправьте описание к фото:", parse_mode="Markdown")
     await state.set_state(AdminStates.waiting_for_description)
 
 @dp.message(AdminStates.waiting_for_description, IsAdminFilter(), F.text)
 async def plus_foto_desc(message: Message, state: FSMContext):
     data = await state.get_data()
     execute_query("INSERT INTO photos (file_id, rarity, description) VALUES (?, ?, ?)", (data.get("file_id"), data.get("rarity"), message.text))
-    await message.reply("ð Ð¤Ð¾ÑÐ¾Ð³ÑÐ°ÑÐ¸Ñ ÑÑÐ¿ÐµÑÐ½Ð¾ Ð´Ð¾Ð±Ð°Ð²Ð»ÐµÐ½Ð° Ð² Ð±Ð°Ð·Ñ!")
+    await message.reply("🎉 Фотография успешно добавлена в базу данных!")
     await state.clear()
 
+# 2) Команда /add ... /save
 @dp.message(Command("add"), IsAdminFilter())
 async def add_broadcast_start(message: Message, state: FSMContext):
-    await message.reply("ð¢ *Ð¡Ð¾Ð·Ð´Ð°Ð½Ð¸Ðµ ÑÐ°ÑÑÑÐ»ÐºÐ¸.*\nÐÑÐ¿ÑÐ°Ð²Ð»ÑÐ¹ÑÐµ ÑÐ¾Ð¾Ð±ÑÐµÐ½Ð¸Ñ. ÐÐ»Ñ Ð·Ð°Ð²ÐµÑÑÐµÐ½Ð¸Ñ Ð¾ÑÐ¿ÑÐ°Ð²ÑÑÐµ ÐºÐ¾Ð¼Ð°Ð½Ð´Ñ `/save`.", parse_mode="Markdown")
+    await message.reply("📢 *Режим создания рассылки активирован.*\n\nОтправляйте любые сообщения. Для завершения и запуска отправьте `/save`.", parse_mode="Markdown")
     await state.update_data(broadcast_messages=[])
     await state.set_state(AdminStates.waiting_for_broadcast_messages)
 
@@ -367,18 +383,18 @@ async def add_broadcast_collect(message: Message, state: FSMContext):
     messages_list = data.get("broadcast_messages", [])
     messages_list.append({"chat_id": message.chat.id, "message_id": message.message_id})
     await state.update_data(broadcast_messages=messages_list)
-    await message.reply(f"ð¥ Ð¡Ð¾Ð¾Ð±ÑÐµÐ½Ð¸Ðµ #{len(messages_list)} Ð·Ð°Ð¿Ð¸ÑÐ°Ð½Ð¾.")
+    await message.reply(f"📥 Сообщение #{len(messages_list)} записано в очередь.")
 
 async def run_broadcast(message: Message, state: FSMContext):
     data = await state.get_data()
     messages_list = data.get("broadcast_messages", [])
     if not messages_list:
-        await message.reply("â ï¸ Ð¡Ð¿Ð¸ÑÐ¾Ðº Ð¿ÑÑÑ.")
+        await message.reply("⚠️ Очередь рассылки пуста.")
         await state.clear()
         return
         
     targets = {row[0] for row in execute_query("SELECT chat_id FROM chats", fetchall=True)} | {row[0] for row in execute_query("SELECT user_id FROM users", fetchall=True)}
-    await message.reply(f"ð Ð Ð°ÑÑÑÐ»Ð°Ñ Ð¿Ð¾ {len(targets)} ÑÐ°ÑÐ°Ð¼...")
+    await message.reply(f"🚀 Начинаю рассылку по {len(targets)} чатам...")
     
     success, fail = 0, 0
     for target_chat_id in targets:
@@ -390,21 +406,23 @@ async def run_broadcast(message: Message, state: FSMContext):
         except Exception:
             fail += 1
             
-    await message.reply(f"ð *Ð Ð°ÑÑÑÐ»ÐºÐ° Ð·Ð°Ð²ÐµÑÑÐµÐ½Ð°!*\n\nâ Ð£ÑÐ¿ÐµÑÐ½Ð¾: *{success}*\nâ ÐÑÐ¸Ð±ÐºÐ¸: *{fail}*", parse_mode="Markdown")
+    await message.reply(f"🏁 *Рассылка завершена!*\n\n✅ Успешно: *{success}*\n❌ Ошибки: *{fail}*", parse_mode="Markdown")
     await state.clear()
 
+# 3) Команда /now_admin_cod
 @dp.message(Command("now_admin_cod"), IsAdminFilter())
 async def generate_admin_code_cmd(message: Message):
     code = "".join(random.sample(string.digits, 7) + random.sample(string.ascii_letters, 3))
     execute_query("INSERT INTO admin_codes (code, created_at, used) VALUES (?, ?, 0)", (code, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-    await message.reply(f"ð ÐÐ¾Ð´ Ð°Ð´Ð¼Ð¸Ð½Ð¸ÑÑÑÐ°ÑÐ¾ÑÐ°:\n`{code}`\n\nÐÐµÐ¹ÑÑÐ²ÑÐµÑ 3 ÑÐ°ÑÐ°. ÐÐ²Ð¾Ð´Ð¸ÑÑ ÑÐµÑÐµÐ· `/I_am_admin`.", parse_mode="Markdown")
+    await message.reply(f"🔑 *Сгенерирован код администратора:*\n\n`{code}`\n\nДействует 3 часа. Вводить через `/i_am_admin`.", parse_mode="Markdown")
 
-@dp.message(Command("I_am_admin"))
+# Стать админом (принимает и /i_am_admin, и /I_am_admin)
+@dp.message(Command("i_am_admin", "I_am_admin"))
 async def I_am_admin_start(message: Message, state: FSMContext):
     if is_admin_user(message.from_user.id):
-        await message.reply("ÐÑ ÑÐ¶Ðµ Ð°Ð´Ð¼Ð¸Ð½Ð¸ÑÑÑÐ°ÑÐ¾Ñ!")
+        await message.reply("Вы уже являетесь администратором бота!")
         return
-    await message.reply("ð ÐÐ²ÐµÐ´Ð¸ÑÐµ 10-Ð·Ð½Ð°ÑÐ½ÑÐ¹ ÐºÐ¾Ð´:")
+    await message.reply("🔑 Введите 10-значный код администратора:")
     await state.set_state(AdminStates.waiting_for_admin_code)
 
 @dp.message(AdminStates.waiting_for_admin_code)
@@ -413,26 +431,32 @@ async def I_am_admin_verify(message: Message, state: FSMContext):
     code_data = execute_query("SELECT created_at, used FROM admin_codes WHERE code = ?", (input_code,), fetchone=True)
     
     if not code_data or code_data[1] == 1 or datetime.now() - datetime.strptime(code_data[0], "%Y-%m-%d %H:%M:%S") > timedelta(hours=3):
-        await message.reply("â ÐÐµÐ²ÐµÑÐ½ÑÐ¹, Ð¸ÑÐ¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°Ð½Ð½ÑÐ¹ Ð¸Ð»Ð¸ Ð¸ÑÑÐµÐºÑÐ¸Ð¹ ÐºÐ¾Ð´.")
+        await message.reply("❌ Неверный, использованный или истекший код.")
         await state.clear()
         return
         
     execute_query("UPDATE admin_codes SET used = 1 WHERE code = ?", (input_code,))
     execute_query("UPDATE users SET is_admin = 1 WHERE user_id = ?", (message.from_user.id,))
-    await message.reply("ð ÐÑ ÑÑÐ¿ÐµÑÐ½Ð¾ ÑÑÐ°Ð»Ð¸ Ð°Ð´Ð¼Ð¸Ð½Ð¸ÑÑÑÐ°ÑÐ¾ÑÐ¾Ð¼ Ð±Ð¾ÑÐ°!", parse_mode="Markdown")
+    await message.reply("🎉 Поздравляем! Вы успешно получили права администратора бота.", parse_mode="Markdown")
     await state.clear()
 
+# ----------------------------------------------------------------------
+# ЗАПУСК БОТА
+# ----------------------------------------------------------------------
 async def main():
     if not API_TOKEN:
-        raise ValueError("BOT_TOKEN Ð½Ðµ ÑÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½ Ð² Ð¿ÐµÑÐµÐ¼ÐµÐ½Ð½ÑÑ Ð¾ÐºÑÑÐ¶ÐµÐ½Ð¸Ñ!")
+        raise ValueError("BOT_TOKEN не установлен в переменных окружения!")
     init_db()
+    
+    # Регистрируем команды в Telegram меню (все имена команд строго в нижнем регистре!)
     await bot.set_my_commands([
-        BotCommand(command="foto", description="ÐÐ¾Ð»ÑÑÐ¸ÑÑ ÑÐµÐ¼-ÑÐ¾ÑÐ¾ (ÑÐ°Ð· Ð² 3 ÑÐ°ÑÐ°)"),
-        BotCommand(command="profil", description="ÐÑÐ¾ÑÐ¸Ð»Ñ Ð¸ ÐºÐ¾Ð»Ð»ÐµÐºÑÐ¸Ñ"),
-        BotCommand(command="admin", description="ÐÐ½ÑÐ¾ÑÐ¼Ð°ÑÐ¸Ñ Ð¾Ð± Ð°Ð´Ð¼Ð¸Ð½Ð°Ñ"),
-        BotCommand(command="I_am_admin", description="Ð¡ÑÐ°ÑÑ Ð°Ð´Ð¼Ð¸Ð½Ð¾Ð¼")
+        BotCommand(command="foto", description="Получить фем-фото (раз в 3 часа)"),
+        BotCommand(command="profil", description="Посмотреть свой профиль и коллекцию"),
+        BotCommand(command="admin", description="Информация об админах"),
+        BotCommand(command="i_am_admin", description="Запросить права админа по коду")
     ])
-    logging.info("ÐÐ¾Ñ Ð·Ð°Ð¿ÑÑÐµÐ½!")
+    
+    logging.info("Бот успешно запущен и готов к работе!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
