@@ -69,7 +69,8 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             username TEXT,
             is_admin INTEGER DEFAULT 0,
-            last_foto_time TEXT
+            last_foto_time TEXT,
+            joined_at TEXT
         )
     ''')
     cursor.execute('''
@@ -103,6 +104,22 @@ def init_db():
         )
     ''')
     cursor.execute('''
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY,
+            promo_type TEXT,
+            expires_at TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS promo_uses (
+            code TEXT,
+            user_id INTEGER,
+            PRIMARY KEY (code, user_id),
+            FOREIGN KEY (code) REFERENCES promo_codes(code),
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+    ''')
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -111,7 +128,8 @@ def init_db():
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('admin_info', 'Администрация еще не настроила этот текст. Используйте /set_admin_text для его изменения.')")
     
     if SUPER_ADMIN_ID != 0:
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, username, is_admin) VALUES (?, ?, 1)", (SUPER_ADMIN_ID, "SuperAdmin"))
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("INSERT OR IGNORE INTO users (user_id, username, is_admin, joined_at) VALUES (?, ?, 1, ?)", (SUPER_ADMIN_ID, "SuperAdmin", now_str))
         cursor.execute("UPDATE users SET is_admin = 1 WHERE user_id = ?", (SUPER_ADMIN_ID,))
     
     conn.commit()
@@ -132,11 +150,12 @@ def execute_query(query, params=(), fetchone=False, fetchall=False, commit=True)
     return result
 
 def register_user_and_chat(user_id: int, username: str, chat_id: int, chat_type: str):
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     user_exists = execute_query("SELECT user_id FROM users WHERE user_id = ?", (user_id,), fetchone=True)
     if not user_exists:
         execute_query(
-            "INSERT INTO users (user_id, username, is_admin, last_foto_time) VALUES (?, ?, 0, NULL)", 
-            (user_id, username)
+            "INSERT INTO users (user_id, username, is_admin, last_foto_time, joined_at) VALUES (?, ?, 0, NULL, ?)", 
+            (user_id, username, now_str)
         )
     else:
         execute_query("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
@@ -152,8 +171,6 @@ def is_admin_user(user_id: int) -> bool:
 # ----------------------------------------------------------------------
 # MIDDLEWARE И ФИЛЬТРЫ
 # ----------------------------------------------------------------------
-
-# Автоматическая регистрация пользователей и чатов при любом сообщении
 class RegisterMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         if isinstance(event, Message) and event.from_user:
@@ -193,10 +210,9 @@ async def on_my_chat_member(update: types.ChatMemberUpdated):
         execute_query("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
 
 # ----------------------------------------------------------------------
-# АДМИНИСТРАТИВНЫЕ КОМАНДЫ (Имеют приоритет)
+# АДМИНИСТРАТИВНЫЕ КОМАНДЫ
 # ----------------------------------------------------------------------
 
-# Изменение текста /admin
 @dp.message(Command("set_admin_text"), IsAdminFilter())
 async def set_admin_text_start(message: Message, state: FSMContext):
     await message.reply("Отправьте новый текст для команды /admin:")
@@ -284,7 +300,6 @@ async def generate_admin_code_cmd(message: Message):
     execute_query("INSERT INTO admin_codes (code, created_at, used) VALUES (?, ?, 0)", (code, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     await message.reply(f"🔑 *Сгенерирован код администратора:*\n\n`{code}`\n\nДействует 3 часа. Вводить через `/i_am_admin`.", parse_mode="Markdown")
 
-# Стать админом (принимает и /i_am_admin, и /I_am_admin)
 @dp.message(Command("i_am_admin", "I_am_admin"))
 async def I_am_admin_start(message: Message, state: FSMContext):
     if is_admin_user(message.from_user.id):
@@ -308,8 +323,175 @@ async def I_am_admin_verify(message: Message, state: FSMContext):
     await message.reply("🎉 Поздравляем! Вы успешно получили права администратора бота.", parse_mode="Markdown")
     await state.clear()
 
+
 # ----------------------------------------------------------------------
-# ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ И ТРИГГЕРЫ
+# НОВЫЙ ФУНКЦИОНАЛ: ПРОМОКОДЫ (1 и 2)
+# ----------------------------------------------------------------------
+
+# Вспомогательная функция парсинга срока действия (от 1 часа до 1 года)
+def parse_duration(duration_str: str) -> timedelta:
+    duration_str = duration_str.lower().strip()
+    num = int(''.join(filter(str.isdigit, duration_str)) or 1)
+    
+    if "год" in duration_str or "лет" in duration_str or "year" in duration_str:
+        return timedelta(days=365 * num)
+    elif "мес" in duration_str or "month" in duration_str:
+        return timedelta(days=30 * num)
+    elif "дн" in duration_str or "день" in duration_str or "day" in duration_str:
+        return timedelta(days=num)
+    elif "час" in duration_str or "hour" in duration_str:
+        return timedelta(hours=num)
+    else:
+        # По умолчанию считаем часы
+        return timedelta(hours=num)
+
+# Команда /creat_promo_1 (одноразовый промокод для сброса кд)
+@dp.message(Command("creat_promo_1"), IsAdminFilter())
+async def create_promo_1_cmd(message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply(
+            "⚠️ Укажите срок действия промокода!\n"
+            "Пример: `/creat_promo_1 24 часа` или `/creat_promo_1 7 дней`",
+            parse_mode="Markdown"
+        )
+        return
+        
+    duration_delta = parse_duration(args[1])
+    expires_at = (datetime.now() + duration_delta).strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Генерация случайного красивого промокода (8 символов)
+    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    
+    execute_query(
+        "INSERT INTO promo_codes (code, promo_type, expires_at) VALUES (?, 'single', ?)",
+        (code, expires_at)
+    )
+    
+    await message.reply(
+        f"🎟 *Создан ОДНОРАЗОВЫЙ промокод (сброс кд)*:\n\n"
+        f"`{code}`\n\n"
+        f"⏳ Срок действия: до *{expires_at}*\n"
+        f"Использовать могут разные люди, но каждый промокод действует суммарно на 1 активацию (или можно сделать индивидуальным — см. логику ниже).",
+        parse_mode="Markdown"
+    )
+
+# Команда /create_promo_2 (многоразовый промокод, каждый юзер может использовать 1 раз)
+@dp.message(Command("create_promo_2"), IsAdminFilter())
+async def create_promo_2_cmd(message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply(
+            "⚠️ Укажите срок действия промокода!\n"
+            "Пример: `/create_promo_2 30 дней` или `/create_promo_2 1 год`",
+            parse_mode="Markdown"
+        )
+        return
+        
+    duration_delta = parse_duration(args[1])
+    expires_at = (datetime.now() + duration_delta).strftime("%Y-%m-%d %H:%M:%S")
+    
+    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    
+    execute_query(
+        "INSERT INTO promo_codes (code, promo_type, expires_at) VALUES (?, 'multi', ?)",
+        (code, expires_at)
+    )
+    
+    await message.reply(
+        f"🎟 *Создан МНОГОРАЗОВЫЙ промокод (сброс кд)*:\n\n"
+        f"`{code}`\n\n"
+        f"⏳ Срок действия: до *{expires_at}*\n"
+        f"Каждый пользователь может активировать этот код ровно 1 раз.",
+        parse_mode="Markdown"
+    )
+
+# Активация промокода пользователем: /promo КОД
+@dp.message(Command("promo"))
+async def activate_promo_cmd(message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.reply("⚠️ Введите промокод после команды. Пример: `/promo ABC123XYZ`", parse_mode="Markdown")
+        return
+        
+    code = args[1].strip().upper()
+    user_id = message.from_user.id
+    
+    promo = execute_query("SELECT promo_type, expires_at FROM promo_codes WHERE code = ?", (code,), fetchone=True)
+    if not promo:
+        await message.reply("❌ Такого промокода не существует или он введен неверно.")
+        return
+        
+    promo_type, expires_at_str = promo
+    
+    # Проверка срока действия
+    if datetime.now() > datetime.strptime(expires_at_str, "%Y-%m-%d %H:%M:%S"):
+        await message.reply("⏳ Срок действия этого промокода истёк.")
+        return
+        
+    if promo_type == 'single':
+        # Проверяем, использовал ли его хоть кто-то
+        uses_count = execute_query("SELECT COUNT(*) FROM promo_uses WHERE code = ?", (code,), fetchone=True)[0]
+        if uses_count > 0:
+            await message.reply("❌ Этот одноразовый промокод уже был кем-то активирован.")
+            return
+        # Фиксируем использование и сбрасываем КД
+        execute_query("INSERT INTO promo_uses (code, user_id) VALUES (?, ?)", (code, user_id))
+        execute_query("UPDATE users SET last_foto_time = NULL WHERE user_id = ?", (user_id,))
+        await message.reply("🎉 *Промокод успешно активирован!*\n\n⏳ Ваше 3-часовое ожидание сброшено! Вы можете прямо сейчас получить фото через `/foto`.", parse_mode="Markdown")
+        
+    elif promo_type == 'multi':
+        # Проверяем, использовал ли его именно этот юзер
+        already_used = execute_query("SELECT 1 FROM promo_uses WHERE code = ? AND user_id = ?", (code, user_id), fetchone=True)
+        if already_used:
+            await message.reply("❌ Вы уже использовали этот многоразовый промокод ранее.")
+            return
+            
+        execute_query("INSERT INTO promo_uses (code, user_id) VALUES (?, ?)", (code, user_id))
+        execute_query("UPDATE users SET last_foto_time = NULL WHERE user_id = ?", (user_id,))
+        await message.reply("🎉 *Промокод успешно активирован!*\n\n⏳ Ваше 3-часовое ожидание сброшено! Вы можете прямо сейчас получить фото через `/foto`.", parse_mode="Markdown")
+
+
+# ----------------------------------------------------------------------
+# НОВЫЙ ФУНКЦИОНАЛ: СТАТИСТИКА И ТОП-10 ИГРОКОВ (2)
+# ----------------------------------------------------------------------
+@dp.message(Command("top"), F.text.func(lambda text: text and text.lower().strip() in ["статистика", "топ", "top"]))
+@dp.message(Command("stat"))
+async def handle_stats_cmd(message: Message):
+    # Запрос на топ-10 игроков:
+    # Считаем количество уникальных фото у каждого пользователя.
+    # Сортировка: 
+    # 1) по количеству фото (по убыванию DESC)
+    # 2) по дате регистрации / старости (по возрастанию ASC — кто раньше зарегистрировался, тот выше)
+    top_users = execute_query(
+        """
+        SELECT u.username, u.user_id, COUNT(up.photo_id) as foto_count, u.joined_at
+        FROM users u
+        LEFT JOIN user_photos up ON u.user_id = up.user_id
+        GROUP BY u.user_id
+        ORDER BY foto_count DESC, u.joined_at ASC
+        LIMIT 10
+        """,
+        fetchall=True
+    )
+    
+    if not top_users:
+        await message.reply("📊 Статистика пока пуста.")
+        return
+        
+    text = "🏆 *Топ-10 Игроков Коллекционеров:*\n\n"
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    
+    for idx, (username, u_id, count, joined_at) in enumerate(top_users):
+        medal = medals[idx] if idx < len(medals) else f"{idx+1}."
+        name = f"@{username}" if username and username != "Unknown" else f"ID: {u_id}"
+        text += f"{medal} *{name}* — 📦 *{count}* фото\n"
+        
+    await message.reply(text, parse_mode="Markdown")
+
+
+# ----------------------------------------------------------------------
+# ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ И ТРИГГЕРЫ (Фем, Профиль, Кто админ)
 # ----------------------------------------------------------------------
 
 # 1) Команда /foto или триггер «фем»
@@ -329,7 +511,8 @@ async def handle_foto_cmd(message: Message):
             hours, remainder = divmod(remaining.seconds, 3600)
             minutes, seconds = divmod(remainder, 60)
             await message.reply(
-                f"⏳ Вы уже брали фото! Попробуйте снова через:\n*{hours:02d}:{minutes:02d}:{seconds:02d}*.",
+                f"⏳ Вы уже брали фото! Попробуйте снова через:\n*{hours:02d}:{minutes:02d}:{seconds:02d}*.\n\n"
+                f"💡 _Активируйте промокод командой `/promo КОД`, чтобы пропустить ожидание!_",
                 parse_mode="Markdown"
             )
             return
@@ -375,7 +558,6 @@ async def handle_profile_cmd(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🖼 Смотреть все фото", callback_data="view_collection:0")]])
     await message.reply_photo(photo=avatar_url, caption=caption, reply_markup=keyboard, parse_mode="Markdown")
 
-# Навигация по коллекции
 @dp.callback_query(F.data.startswith("view_collection:"))
 async def view_collection_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -445,7 +627,9 @@ async def main():
         BotCommand(command="foto", description="Получить фем-фото (раз в 3 часа)"),
         BotCommand(command="profil", description="Посмотреть свой профиль и коллекцию"),
         BotCommand(command="admin", description="Информация об админах"),
-        BotCommand(command="i_am_admin", description="Запросить права админа по коду")
+        BotCommand(command="i_am_admin", description="Запросить права админа по коду"),
+        BotCommand(command="stat", description="Топ-10 игроков и статистика"),
+        BotCommand(command="promo", description="Активировать промокод")
     ])
     
     logging.info("Бот успешно запущен и готов к работе!")
