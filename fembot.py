@@ -6,7 +6,7 @@ import string
 import os
 from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import Command, BaseFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -55,7 +55,7 @@ RARITY_ORDER = {
     "редкое": 6
 }
 
-# Аватар по умолчанию, если у пользователя нет фото профиля
+# Аватар по умолчанию
 DEFAULT_AVATAR = "https://placehold.co/600x600/png?text=No+Avatar"
 
 # ----------------------------------------------------------------------
@@ -150,8 +150,21 @@ def is_admin_user(user_id: int) -> bool:
     return bool(res and res[0] == 1)
 
 # ----------------------------------------------------------------------
-# СТЕЙТЫ FSM И ФИЛЬТРЫ
+# MIDDLEWARE И ФИЛЬТРЫ
 # ----------------------------------------------------------------------
+
+# Автоматическая регистрация пользователей и чатов при любом сообщении
+class RegisterMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message) and event.from_user:
+            register_user_and_chat(
+                user_id=event.from_user.id,
+                username=event.from_user.username or "Unknown",
+                chat_id=event.chat.id,
+                chat_type=event.chat.type
+            )
+        return await handler(event, data)
+
 class AdminStates(StatesGroup):
     waiting_for_photo = State()
     waiting_for_rarity = State()
@@ -167,6 +180,7 @@ class IsAdminFilter(BaseFilter):
 # Инициализация бота
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+dp.message.outer_middleware(RegisterMiddleware())
 
 # Отслеживание добавления/удаления бота из чатов
 @dp.my_chat_member()
@@ -178,154 +192,8 @@ async def on_my_chat_member(update: types.ChatMemberUpdated):
     elif update.new_chat_member.status in ["left", "kicked"]:
         execute_query("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
 
-# Глобальный обработчик текста для триггеров и регистрации
-@dp.message(F.text)
-async def global_message_handler(message: Message, state: FSMContext):
-    register_user_and_chat(
-        user_id=message.from_user.id,
-        username=message.from_user.username or "Unknown",
-        chat_id=message.chat.id,
-        chat_type=message.chat.type
-    )
-    text_lower = message.text.lower().strip()
-    if text_lower == "фем":
-        await handle_foto_cmd(message)
-    elif text_lower == "профиль":
-        await handle_profile_cmd(message)
-    elif text_lower == "кто админ":
-        await handle_admin_info_cmd(message)
-    else:
-        await dp.propagate_event(update=message.by_custom_key, message=message, state=state)
-
 # ----------------------------------------------------------------------
-# ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ
-# ----------------------------------------------------------------------
-
-# 1) Команда /foto
-@dp.message(Command("foto"))
-async def handle_foto_cmd(message: Message):
-    user_id = message.from_user.id
-    register_user_and_chat(user_id, message.from_user.username or "Unknown", message.chat.id, message.chat.type)
-    
-    user_data = execute_query("SELECT last_foto_time FROM users WHERE user_id = ?", (user_id,), fetchone=True)
-    now = datetime.now()
-    
-    if user_data and user_data[0]:
-        last_time = datetime.strptime(user_data[0], "%Y-%m-%d %H:%M:%S")
-        time_diff = now - last_time
-        cooldown_period = timedelta(hours=3)
-        if time_diff < cooldown_period:
-            remaining = cooldown_period - time_diff
-            hours, remainder = divmod(remaining.seconds, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            await message.reply(
-                f"⏳ Вы уже брали фото! Попробуйте снова через:\n*{hours:02d}:{minutes:02d}:{seconds:02d}*.",
-                parse_mode="Markdown"
-            )
-            return
-
-    rarities = list(RARITIES_WEIGHTS.keys())
-    weights = list(RARITIES_WEIGHTS.values())
-    chosen_rarity = random.choices(rarities, weights=weights, k=1)[0]
-    
-    photos = execute_query("SELECT id, file_id, description FROM photos WHERE rarity = ?", (chosen_rarity,), fetchall=True)
-    if not photos:
-        photos = execute_query("SELECT id, file_id, rarity, description FROM photos ORDER BY RANDOM() LIMIT 1", fetchall=True)
-        if not photos:
-            await message.reply("😔 В базе пока нет фото. Обратитесь к администраторам.")
-            return
-        photo_id, file_id, real_rarity, description = photos[0]
-        chosen_rarity = real_rarity
-    else:
-        photo_id, file_id, description = random.choice(photos)
-        
-    execute_query("INSERT OR IGNORE INTO user_photos (user_id, photo_id) VALUES (?, ?)", (user_id, photo_id))
-    execute_query("UPDATE users SET last_foto_time = ? WHERE user_id = ?", (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
-    
-    caption = f"🎉 *Вы получили новое фото!*\n\n⭐ *Редкость:* {chosen_rarity.capitalize()}\n📝 *Описание:* {description}"
-    await bot.send_photo(chat_id=message.chat.id, photo=file_id, caption=caption, parse_mode="Markdown")
-
-# 2) Команда /profil
-@dp.message(Command("profil"))
-async def handle_profile_cmd(message: Message):
-    user_id = message.from_user.id
-    register_user_and_chat(user_id, message.from_user.username or "Unknown", message.chat.id, message.chat.type)
-    
-    user_photos_count = execute_query("SELECT COUNT(DISTINCT photo_id) FROM user_photos WHERE user_id = ?", (user_id,), fetchone=True)[0]
-    total_photos_count = execute_query("SELECT COUNT(*) FROM photos", fetchone=True)[0]
-    
-    avatar_url = DEFAULT_AVATAR
-    try:
-        user_profile_photos = await bot.get_user_profile_photos(user_id, limit=1)
-        if user_profile_photos.total_count > 0:
-            avatar_url = user_profile_photos.photos[0][-1].file_id
-    except Exception as e:
-        logging.warning(f"Ошибка получения аватара: {e}")
-
-    caption = f"👤 *Ваш Профиль:*\n\n🏷 *Имя:* {message.from_user.full_name}\n📦 *Ваша коллекция:* {user_photos_count} из {total_photos_count} фото.\n"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🖼 Смотреть все фото", callback_data="view_collection:0")]])
-    await message.reply_photo(photo=avatar_url, caption=caption, reply_markup=keyboard, parse_mode="Markdown")
-
-# Навигация по коллекции
-@dp.callback_query(F.data.startswith("view_collection:"))
-async def view_collection_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    index = int(callback.data.split(":")[1])
-    
-    user_photos = execute_query(
-        "SELECT p.id, p.file_id, p.rarity, p.description FROM user_photos up JOIN photos p ON up.photo_id = p.id WHERE up.user_id = ?", 
-        (user_id,), fetchall=True
-    )
-    if not user_photos:
-        await callback.answer("😢 У вас пока нет ни одного фото в коллекции!", show_alert=True)
-        return
-        
-    sorted_photos = sorted(user_photos, key=lambda x: RARITY_ORDER.get(x[2].lower(), 99))
-    total_photos = len(sorted_photos)
-    index = max(0, min(index, total_photos - 1))
-    
-    photo_id, file_id, rarity, description = sorted_photos[index]
-    caption = f"🖼 *Ваша Коллекция* ({index + 1} из {total_photos})\n\n⭐ *Редкость:* {rarity.capitalize()}\n📝 *Описание:* {description}"
-    
-    buttons = []
-    nav_row = []
-    if index > 0:
-        nav_row.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"view_collection:{index - 1}"))
-    if index < total_photos - 1:
-        nav_row.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"view_collection:{index + 1}"))
-    if nav_row:
-        buttons.append(nav_row)
-    buttons.append([InlineKeyboardButton(text="👤 Вернуться в профиль", callback_data="back_to_profile")])
-    
-    await callback.message.edit_media(media=InputMediaPhoto(media=file_id, caption=caption, parse_mode="Markdown"), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-@dp.callback_query(F.data == "back_to_profile")
-async def back_to_profile_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    user_photos_count = execute_query("SELECT COUNT(DISTINCT photo_id) FROM user_photos WHERE user_id = ?", (user_id,), fetchone=True)[0]
-    total_photos_count = execute_query("SELECT COUNT(*) FROM photos", fetchone=True)[0]
-    
-    avatar_url = DEFAULT_AVATAR
-    try:
-        user_profile_photos = await bot.get_user_profile_photos(user_id, limit=1)
-        if user_profile_photos.total_count > 0:
-            avatar_url = user_profile_photos.photos[0][-1].file_id
-    except Exception:
-        pass
-
-    caption = f"👤 *Ваш Профиль:*\n\n🏷 *Имя:* {callback.from_user.full_name}\n📦 *Ваша коллекция:* {user_photos_count} из {total_photos_count} фото.\n"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🖼 Смотреть все фото", callback_data="view_collection:0")]])
-    await callback.message.edit_media(media=InputMediaPhoto(media=avatar_url, caption=caption, parse_mode="Markdown"), reply_markup=keyboard)
-
-# 3) Команда /admin
-@dp.message(Command("admin"))
-async def handle_admin_info_cmd(message: Message):
-    register_user_and_chat(message.from_user.id, message.from_user.username or "Unknown", message.chat.id, message.chat.type)
-    admin_info = execute_query("SELECT value FROM settings WHERE key = 'admin_info'", fetchone=True)
-    await message.reply(admin_info[0] if admin_info else "Администрация не настроена.")
-
-# ----------------------------------------------------------------------
-# АДМИНИСТРАТИВНЫЕ КОМАНДЫ
+# АДМИНИСТРАТИВНЫЕ КОМАНДЫ (Имеют приоритет)
 # ----------------------------------------------------------------------
 
 # Изменение текста /admin
@@ -441,6 +309,131 @@ async def I_am_admin_verify(message: Message, state: FSMContext):
     await state.clear()
 
 # ----------------------------------------------------------------------
+# ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ И ТРИГГЕРЫ
+# ----------------------------------------------------------------------
+
+# 1) Команда /foto или триггер «фем»
+@dp.message(Command("foto"))
+@dp.message(F.text.func(lambda text: text and text.lower().strip() == "фем"))
+async def handle_foto_cmd(message: Message):
+    user_id = message.from_user.id
+    user_data = execute_query("SELECT last_foto_time FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    now = datetime.now()
+    
+    if user_data and user_data[0]:
+        last_time = datetime.strptime(user_data[0], "%Y-%m-%d %H:%M:%S")
+        time_diff = now - last_time
+        cooldown_period = timedelta(hours=3)
+        if time_diff < cooldown_period:
+            remaining = cooldown_period - time_diff
+            hours, remainder = divmod(remaining.seconds, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            await message.reply(
+                f"⏳ Вы уже брали фото! Попробуйте снова через:\n*{hours:02d}:{minutes:02d}:{seconds:02d}*.",
+                parse_mode="Markdown"
+            )
+            return
+
+    rarities = list(RARITIES_WEIGHTS.keys())
+    weights = list(RARITIES_WEIGHTS.values())
+    chosen_rarity = random.choices(rarities, weights=weights, k=1)[0]
+    
+    photos = execute_query("SELECT id, file_id, description FROM photos WHERE rarity = ?", (chosen_rarity,), fetchall=True)
+    if not photos:
+        photos = execute_query("SELECT id, file_id, rarity, description FROM photos ORDER BY RANDOM() LIMIT 1", fetchall=True)
+        if not photos:
+            await message.reply("😔 В базе пока нет фото. Обратитесь к администраторам.")
+            return
+        photo_id, file_id, real_rarity, description = photos[0]
+        chosen_rarity = real_rarity
+    else:
+        photo_id, file_id, description = random.choice(photos)
+        
+    execute_query("INSERT OR IGNORE INTO user_photos (user_id, photo_id) VALUES (?, ?)", (user_id, photo_id))
+    execute_query("UPDATE users SET last_foto_time = ? WHERE user_id = ?", (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
+    
+    caption = f"🎉 *Вы получили новое фото!*\n\n⭐ *Редкость:* {chosen_rarity.capitalize()}\n📝 *Описание:* {description}"
+    await bot.send_photo(chat_id=message.chat.id, photo=file_id, caption=caption, parse_mode="Markdown")
+
+# 2) Команда /profil или триггер «профиль»
+@dp.message(Command("profil"))
+@dp.message(F.text.func(lambda text: text and text.lower().strip() == "профиль"))
+async def handle_profile_cmd(message: Message):
+    user_id = message.from_user.id
+    user_photos_count = execute_query("SELECT COUNT(DISTINCT photo_id) FROM user_photos WHERE user_id = ?", (user_id,), fetchone=True)[0]
+    total_photos_count = execute_query("SELECT COUNT(*) FROM photos", fetchone=True)[0]
+    
+    avatar_url = DEFAULT_AVATAR
+    try:
+        user_profile_photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if user_profile_photos.total_count > 0:
+            avatar_url = user_profile_photos.photos[0][-1].file_id
+    except Exception as e:
+        logging.warning(f"Ошибка получения аватара: {e}")
+
+    caption = f"👤 *Ваш Профиль:*\n\n🏷 *Имя:* {message.from_user.full_name}\n📦 *Ваша коллекция:* {user_photos_count} из {total_photos_count} фото.\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🖼 Смотреть все фото", callback_data="view_collection:0")]])
+    await message.reply_photo(photo=avatar_url, caption=caption, reply_markup=keyboard, parse_mode="Markdown")
+
+# Навигация по коллекции
+@dp.callback_query(F.data.startswith("view_collection:"))
+async def view_collection_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    index = int(callback.data.split(":")[1])
+    
+    user_photos = execute_query(
+        "SELECT p.id, p.file_id, p.rarity, p.description FROM user_photos up JOIN photos p ON up.photo_id = p.id WHERE up.user_id = ?", 
+        (user_id,), fetchall=True
+    )
+    if not user_photos:
+        await callback.answer("😢 У вас пока нет ни одного фото в коллекции!", show_alert=True)
+        return
+        
+    sorted_photos = sorted(user_photos, key=lambda x: RARITY_ORDER.get(x[2].lower(), 99))
+    total_photos = len(sorted_photos)
+    index = max(0, min(index, total_photos - 1))
+    
+    photo_id, file_id, rarity, description = sorted_photos[index]
+    caption = f"🖼 *Ваша Коллекция* ({index + 1} из {total_photos})\n\n⭐ *Редкость:* {rarity.capitalize()}\n📝 *Описание:* {description}"
+    
+    buttons = []
+    nav_row = []
+    if index > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"view_collection:{index - 1}"))
+    if index < total_photos - 1:
+        nav_row.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"view_collection:{index + 1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton(text="👤 Вернуться в профиль", callback_data="back_to_profile")])
+    
+    await callback.message.edit_media(media=InputMediaPhoto(media=file_id, caption=caption, parse_mode="Markdown"), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data == "back_to_profile")
+async def back_to_profile_callback(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user_photos_count = execute_query("SELECT COUNT(DISTINCT photo_id) FROM user_photos WHERE user_id = ?", (user_id,), fetchone=True)[0]
+    total_photos_count = execute_query("SELECT COUNT(*) FROM photos", fetchone=True)[0]
+    
+    avatar_url = DEFAULT_AVATAR
+    try:
+        user_profile_photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if user_profile_photos.total_count > 0:
+            avatar_url = user_profile_photos.photos[0][-1].file_id
+    except Exception:
+        pass
+
+    caption = f"👤 *Ваш Профиль:*\n\n🏷 *Имя:* {callback.from_user.full_name}\n📦 *Ваша коллекция:* {user_photos_count} из {total_photos_count} фото.\n"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🖼 Смотреть все фото", callback_data="view_collection:0")]])
+    await callback.message.edit_media(media=InputMediaPhoto(media=avatar_url, caption=caption, parse_mode="Markdown"), reply_markup=keyboard)
+
+# 3) Команда /admin или триггер «кто админ»
+@dp.message(Command("admin"))
+@dp.message(F.text.func(lambda text: text and text.lower().strip() == "кто админ"))
+async def handle_admin_info_cmd(message: Message):
+    admin_info = execute_query("SELECT value FROM settings WHERE key = 'admin_info'", fetchone=True)
+    await message.reply(admin_info[0] if admin_info else "Администрация не настроена.")
+
+# ----------------------------------------------------------------------
 # ЗАПУСК БОТА
 # ----------------------------------------------------------------------
 async def main():
@@ -448,7 +441,6 @@ async def main():
         raise ValueError("BOT_TOKEN не установлен в переменных окружения!")
     init_db()
     
-    # Регистрируем команды в Telegram меню (все имена команд строго в нижнем регистре!)
     await bot.set_my_commands([
         BotCommand(command="foto", description="Получить фем-фото (раз в 3 часа)"),
         BotCommand(command="profil", description="Посмотреть свой профиль и коллекцию"),
