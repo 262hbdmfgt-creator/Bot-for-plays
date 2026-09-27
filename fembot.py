@@ -34,7 +34,6 @@ def fix_mojibake(text: str) -> str:
     if not text or not isinstance(text, str):
         return text or ""
     try:
-        # Проверяем наличие характерных маркеров искаженного UTF-8 (например, "Ð", "Ñ", "ð", "â")
         if any(marker in text for marker in ("Ð", "Ñ", "ðŸ", "â€", "Ã")):
             decoded = text.encode("latin-1").decode("utf-8")
             return decoded
@@ -143,7 +142,6 @@ def init_db():
         ("Администрация еще не настроила этот текст.",)
     )
     
-    # Исправляем admin_info в базе, если там уже были кракозябры
     cursor.execute("SELECT value FROM settings WHERE key = 'admin_info'")
     row = cursor.fetchone()
     if row and row[0]:
@@ -635,7 +633,7 @@ async def back_prof_handler(call: CallbackQuery):
     )
 
 # ----------------------------------------------------------------------
-# СИСТЕМА НАКАЗАНИЙ И МОДЕРАЦИИ
+# СИСТЕМА НАКАЗАНИЙ И ПООЩРЕНИЙ (МОДЕРАЦИЯ И ВЫДАЧА)
 # ----------------------------------------------------------------------
 @dp.message(F.text.lower().startswith("твой профиль"), IsAdminFilter())
 async def admin_view_target_profile(message: Message):
@@ -646,7 +644,121 @@ async def admin_view_target_profile(message: Message):
         return await message.reply("⚠️ Укажите пользователя через @юзернейм или ответом на сообщение!")
     await show_profile_for_user(t_id, t_name, message.chat.id, message.message_id)
 
-@dp.message(F.text.lower().startswith(("/бот +", "!бот +")), IsAdminFilter())
+# --- ПООЩРЕНИЕ: ВЫДАЧА КАРТЫ (ФОТО) ---
+@dp.message(F.text.lower().startswith(("/бот +карта", "!бот +карта", "/бот +фото", "!бот +фото")), IsAdminFilter())
+async def admin_add_card(message: Message):
+    parts = message.text.split()
+    if len(parts) < 3 or not parts[2].isdigit():
+        return await message.reply("⚠️ Формат: `/бот +карта <ID> [@юзер]`", parse_mode="Markdown")
+        
+    card_id = int(parts[2])
+    explicit_user = parts[3] if len(parts) > 3 else None
+    t_id, t_name = resolve_target_user(message, explicit_user)
+    if not t_id:
+        return await message.reply("⚠️ Укажите @юзернейм или ответьте на сообщение!")
+        
+    card = execute_query("SELECT id, rarity, description, file_id FROM photos WHERE id = ?", (card_id,), fetchone=True)
+    if not card:
+        return await message.reply(f"❌ Карты #{card_id} не существует в базе бота!")
+        
+    rar = fix_mojibake(card[1])
+    desc = fix_mojibake(card[2])
+    
+    exists = execute_query("SELECT count FROM user_photos WHERE user_id = ? AND photo_id = ?", (t_id, card_id), fetchone=True)
+    if exists:
+        execute_query("UPDATE user_photos SET count = count + 1 WHERE user_id = ? AND photo_id = ?", (t_id, card_id))
+    else:
+        execute_query("INSERT INTO user_photos (user_id, photo_id, count) VALUES (?, ?, 1)", (t_id, card_id))
+        
+    await message.reply(
+        f"🎁 Карта #{card_id} (*{rar.capitalize()}*) успешно выдана игроку *{clean_surrogates(t_name)}*!\n📝 {desc}",
+        parse_mode="Markdown"
+    )
+
+# --- ПООЩРЕНИЕ: ВЫДАЧА ФЕМКОИНОВ ---
+@dp.message(F.text.lower().startswith(("/бот +фемкоины", "!бот +фемкоины", "/бот +коины", "!бот +коины")), IsAdminFilter())
+async def admin_add_coins(message: Message):
+    parts = message.text.split()
+    if len(parts) < 3 or not parts[2].isdigit():
+        return await message.reply("⚠️ Формат: `/бот +фемкоины 300 [@юзер]`", parse_mode="Markdown")
+        
+    amount = int(parts[2])
+    explicit_user = parts[3] if len(parts) > 3 else None
+    t_id, t_name = resolve_target_user(message, explicit_user)
+    if not t_id:
+        return await message.reply("⚠️ Укажите @юзернейм или ответьте на сообщение!")
+        
+    add_coins(t_id, amount)
+    new_bal = get_user_coins(t_id)
+    await message.reply(
+        f"💰 Игроку *{clean_surrogates(t_name)}* успешно начислено *+{amount}* фемкоинов 🪙.\nТекущий баланс: *{new_bal}* 🪙",
+        parse_mode="Markdown"
+    )
+
+# --- ПООЩРЕНИЕ: СБРОС КУЛДАУНА И СНЯТИЕ ШТРАФА (-КД) ---
+@dp.message(F.text.lower().startswith(("/бот -кд", "!бот -кд", "/бот сброс кд", "!бот сброс кд")), IsAdminFilter())
+async def admin_reset_cooldown(message: Message):
+    parts = message.text.split()
+    explicit_user = None
+    if len(parts) >= 4 and parts[1].lower() == "сброс":
+        explicit_user = parts[3]
+    elif len(parts) >= 3:
+        explicit_user = parts[2]
+        
+    t_id, t_name = resolve_target_user(message, explicit_user)
+    if not t_id:
+        return await message.reply("⚠️ Укажите @юзернейм или ответьте на сообщение!")
+        
+    execute_query("UPDATE users SET last_foto_time = NULL, penalty_extra_hours = 0, penalty_expires = NULL WHERE user_id = ?", (t_id,))
+    await message.reply(
+        f"⚡️ Кулдаун и все штрафы для игрока *{clean_surrogates(t_name)}* успешно аннулированы!",
+        parse_mode="Markdown"
+    )
+
+# --- ШТРАФ: ИЗЪЯТИЕ КАРТЫ ---
+@dp.message(F.text.lower().startswith(("/бот -карта", "!бот -карта", "/бот -фото", "!бот -фото")), IsAdminFilter())
+async def admin_remove_card(message: Message):
+    parts = message.text.split()
+    if len(parts) < 3 or not parts[2].isdigit():
+        return await message.reply("⚠️ Формат: `/бот -карта <ID> [@юзер]`", parse_mode="Markdown")
+        
+    card_id = int(parts[2])
+    explicit_user = parts[3] if len(parts) > 3 else None
+    t_id, t_name = resolve_target_user(message, explicit_user)
+    if not t_id:
+        return await message.reply("⚠️ Укажите @юзернейм или ответьте на сообщение!")
+        
+    has_card = execute_query("SELECT count FROM user_photos WHERE user_id = ? AND photo_id = ?", (t_id, card_id), fetchone=True)
+    if not has_card:
+        return await message.reply(f"❌ У игрока {clean_surrogates(t_name)} нет карты #{card_id}!")
+        
+    cnt = has_card[0]
+    if cnt <= 1:
+        execute_query("DELETE FROM user_photos WHERE user_id = ? AND photo_id = ?", (t_id, card_id))
+    else:
+        execute_query("UPDATE user_photos SET count = count - 1 WHERE user_id = ? AND photo_id = ?", (t_id, card_id))
+        
+    await message.reply(f"🗑 Карта #{card_id} успешно изъята у игрока *{clean_surrogates(t_name)}*!", parse_mode="Markdown")
+
+# --- ШТРАФ: СПИСАНИЕ ФЕМКОИНОВ ---
+@dp.message(F.text.lower().startswith(("/бот -фемкоины", "!бот -фемкоины", "/бот -коины", "!бот -коины")), IsAdminFilter())
+async def admin_remove_coins(message: Message):
+    parts = message.text.split()
+    if len(parts) < 3 or not parts[2].isdigit():
+        return await message.reply("⚠️ Формат: `/бот -фемкоины 300 [@юзер]`", parse_mode="Markdown")
+        
+    amount = int(parts[2])
+    explicit_user = parts[3] if len(parts) > 3 else None
+    t_id, t_name = resolve_target_user(message, explicit_user)
+    if not t_id:
+        return await message.reply("⚠️ Укажите @юзернейм или ответьте на сообщение!")
+        
+    add_coins(t_id, -amount)
+    new_bal = get_user_coins(t_id)
+    await message.reply(f"💸 У игрока *{clean_surrogates(t_name)}* списано *{amount}* фемкоинов 🪙.\nТекущий баланс: *{new_bal}* 🪙", parse_mode="Markdown")
+
+# --- ШТРАФ: УВЕЛИЧЕНИЕ КУЛДАУНА (+КД) ---
+@dp.message(F.text.regexp(r"^[/!](?i:бот)\s+\+\d+\s*(?i:кд)"), IsAdminFilter())
 async def admin_penalty_kd(message: Message):
     text = message.text.strip()
     match = re.search(r"[/!]бот\s+\+(\d+)\s*кд\s+(\d+)\s*(часа|часов|час|ч|дней|дня|д)(?:\s+(@\w+|\d+))?", text, re.IGNORECASE)
@@ -678,46 +790,6 @@ async def admin_penalty_kd(message: Message):
         f"⌛️ Срок действия штрафа: до *{exp_time}*",
         parse_mode="Markdown"
     )
-
-@dp.message(F.text.lower().startswith(("/бот -карта", "!бот -карта")), IsAdminFilter())
-async def admin_remove_card(message: Message):
-    parts = message.text.split()
-    if len(parts) < 3 or not parts[2].isdigit():
-        return await message.reply("⚠️ Формат: `/бот -карта <ID> [@юзер]`", parse_mode="Markdown")
-        
-    card_id = int(parts[2])
-    explicit_user = parts[3] if len(parts) > 3 else None
-    t_id, t_name = resolve_target_user(message, explicit_user)
-    if not t_id:
-        return await message.reply("⚠️ Укажите @юзернейм или ответьте на сообщение!")
-        
-    has_card = execute_query("SELECT count FROM user_photos WHERE user_id = ? AND photo_id = ?", (t_id, card_id), fetchone=True)
-    if not has_card:
-        return await message.reply(f"❌ У игрока {clean_surrogates(t_name)} нет карты #{card_id}!")
-        
-    cnt = has_card[0]
-    if cnt <= 1:
-        execute_query("DELETE FROM user_photos WHERE user_id = ? AND photo_id = ?", (t_id, card_id))
-    else:
-        execute_query("UPDATE user_photos SET count = count - 1 WHERE user_id = ? AND photo_id = ?", (t_id, card_id))
-        
-    await message.reply(f"🗑 Карта #{card_id} успешно изъята у игрока *{clean_surrogates(t_name)}*!", parse_mode="Markdown")
-
-@dp.message(F.text.lower().startswith(("/бот -фемкоины", "!бот -фемкоины")), IsAdminFilter())
-async def admin_remove_coins(message: Message):
-    parts = message.text.split()
-    if len(parts) < 3 or not parts[2].isdigit():
-        return await message.reply("⚠️ Формат: `/бот -фемкоины 300 [@юзер]`", parse_mode="Markdown")
-        
-    amount = int(parts[2])
-    explicit_user = parts[3] if len(parts) > 3 else None
-    t_id, t_name = resolve_target_user(message, explicit_user)
-    if not t_id:
-        return await message.reply("⚠️ Укажите @юзернейм или ответьте на сообщение!")
-        
-    add_coins(t_id, -amount)
-    new_bal = get_user_coins(t_id)
-    await message.reply(f"💸 У игрока *{clean_surrogates(t_name)}* списано *{amount}* фемкоинов 🪙.\nТекущий баланс: *{new_bal}* 🪙", parse_mode="Markdown")
 
 # ----------------------------------------------------------------------
 # ОБМЕН И ТОП
