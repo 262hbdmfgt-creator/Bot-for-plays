@@ -72,13 +72,33 @@ RARITY_LEGENDARY = "легендарное"
 RARITY_ARTIFACT = "фембойский артефакт"
 RARITY_RAREST = "редчайший фем"
 
+# ----------------------------------------------------------------------
+# ОБНОВЛЕННЫЙ БАЛАНС ДРОПА (ШКАЛА 1000 ЕДИНИЦ)
+# ----------------------------------------------------------------------
+# Редкое:               580 / 1000 = 58.0%  (основная масса)
+# Ультра редкое:        280 / 1000 = 28.0%  (обычный дроп)
+# Мифическое:           100 / 1000 = 10.0%  (приятная редкость)
+# Легендарное:           30 / 1000 =  3.0%  (тяжело выбить, 1 из ~33)
+# Фембойский артефакт:    9 / 1000 =  0.9%  (очень тяжело, меньше 1%)
+# Редчайший фем:          1 / 1000 =  0.1%  (джекпот, 1 из 1000!)
 DEFAULT_WEIGHTS = {
-    RARITY_RARE: 40,
-    RARITY_ULTRA: 25,
-    RARITY_MYTHIC: 15,
-    RARITY_LEGENDARY: 12,
-    RARITY_ARTIFACT: 6,
-    RARITY_RAREST: 2
+    RARITY_RARE: 580,
+    RARITY_ULTRA: 280,
+    RARITY_MYTHIC: 100,
+    RARITY_LEGENDARY: 30,
+    RARITY_ARTIFACT: 9,
+    RARITY_RAREST: 1
+}
+
+# Веса под действием "Эликсира удачи" (шансы на топ-карты утраиваются,
+# но Редчайший фем всё равно остаётся редчайшей экзотикой - 0.3%)
+LUCKY_WEIGHTS = {
+    RARITY_RARE: 420,       # 42.0%
+    RARITY_ULTRA: 340,      # 34.0%
+    RARITY_MYTHIC: 160,     # 16.0%
+    RARITY_LEGENDARY: 60,   #  6.0% (в 2 раза чаще)
+    RARITY_ARTIFACT: 17,    #  1.7% (почти в 2 раза чаще)
+    RARITY_RAREST: 3        #  0.3% (в 3 раза чаще)
 }
 
 RARITY_ORDER = {
@@ -352,7 +372,7 @@ async def buy_potion(call: CallbackQuery):
     add_coins(user_id, -250)
     expires = (datetime.now() + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
     execute_query("UPDATE users SET luck_potion_expires = ? WHERE user_id = ?", (expires, user_id))
-    await call.message.edit_text("🍀 Вы купили *Эликсир удачи*! В течение следующих 2 часов шансы на редкие карты значительно выше.", parse_mode="Markdown")
+    await call.message.edit_text("🍀 Вы купили *Эликсир удачи*! В течение следующих 2 часов шансы на легендарные и мифические карты значительно выше.", parse_mode="Markdown")
 
 @dp.callback_query(F.data == "buy_epic")
 async def buy_epic(call: CallbackQuery):
@@ -360,6 +380,7 @@ async def buy_epic(call: CallbackQuery):
     if get_user_coins(user_id) < 350:
         return await call.answer("❌ Недостаточно коинов!", show_alert=True)
     
+    # В магазине продаются только Мифические, Легендарные и Артефакты (Редчайший фем там не падает)
     epic_pool = execute_query(
         "SELECT id, file_id, rarity, description FROM photos WHERE rarity IN (?, ?, ?)",
         (RARITY_MYTHIC, RARITY_LEGENDARY, RARITY_ARTIFACT),
@@ -410,7 +431,7 @@ async def cmd_craft(message: Message):
             btns.append([InlineKeyboardButton(text=f"{rar_clean.capitalize()} (x3 ➔ 1 выше)", callback_data=f"do_craft:{rar_clean}")])
             
     if not btns:
-        return await message.reply("🛠 У вас недостаточно дубликатов (нужно минимум 3 карты одной редкости).")
+        return await message.reply("🛠 У вас недостаточно дубликатов (нужно минимум 3 карты одной редкости для крафта следующего ранга).")
     await message.answer("🛠 *Меню Синтеза*\nВыберите, что переработать:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns), parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("do_craft:"))
@@ -479,18 +500,15 @@ async def handle_foto(message: Message):
                 parse_mode="Markdown"
             )
 
-    weights = DEFAULT_WEIGHTS.copy()
     luck_expires = res[1] if res else None
     is_lucky = False
     if luck_expires and datetime.strptime(luck_expires, "%Y-%m-%d %H:%M:%S") > now:
         is_lucky = True
-        weights[RARITY_RARE] = 20
-        weights[RARITY_ULTRA] = 25
-        weights[RARITY_MYTHIC] = 20
-        weights[RARITY_LEGENDARY] = 20
-        weights[RARITY_ARTIFACT] = 10
-        weights[RARITY_RAREST] = 5
+        weights = LUCKY_WEIGHTS.copy()
+    else:
+        weights = DEFAULT_WEIGHTS.copy()
 
+    # Выбираем категорию редкости на основе весов
     chosen = random.choices(list(weights.keys()), weights=list(weights.values()), k=1)[0]
     photo = execute_query("SELECT id, file_id, rarity, description FROM photos WHERE rarity = ? ORDER BY RANDOM() LIMIT 1", (chosen,), fetchone=True)
     if not photo:
@@ -506,13 +524,24 @@ async def handle_foto(message: Message):
     is_dub = execute_query("SELECT 1 FROM user_photos WHERE user_id = ? AND photo_id = ?", (user_id, p_id), fetchone=True)
     
     prefix = "🍀 *Эликсир удачи сработал!*\n" if is_lucky else ""
+    
+    # Особое оповещение при выпадении джекпота
+    if rar == RARITY_RAREST:
+        celebration = "🌟🔥 **НЕВЕРОЯТНЫЙ ДЖЕКПОТ! ВЫБИТ РЕДЧАЙШИЙ ФЕМ (0.1%)!** 🔥🌟\n\n"
+    elif rar == RARITY_ARTIFACT:
+        celebration = "✨💎 **АРТЕФАКТНЫЙ ДРОП! (0.9%)!** 💎✨\n\n"
+    elif rar == RARITY_LEGENDARY:
+        celebration = "👑 **ЛЕГЕНДАРНЫЙ ДРОП!** 👑\n\n"
+    else:
+        celebration = ""
+
     if is_dub:
         execute_query("UPDATE user_photos SET count = count + 1 WHERE user_id = ? AND photo_id = ?", (user_id, p_id))
         add_coins(user_id, 15)
-        caption = f"{prefix}🃏 *ДУБЛИКАТ!*\n\n+15 коинов 🪙\n⭐ {rar.capitalize()}\n🆔 Карты: #{p_id}"
+        caption = f"{celebration}{prefix}🃏 *ДУБЛИКАТ!*\n\n+15 коинов 🪙\n⭐ {rar.capitalize()}\n🆔 Карты: #{p_id}"
     else:
         execute_query("INSERT INTO user_photos (user_id, photo_id, count) VALUES (?, ?, 1)", (user_id, p_id))
-        caption = f"{prefix}🎉 *НОВАЯ КАРТА!*\n\n⭐ Редкость: {rar.capitalize()}\n📝 {desc}\n🆔 Карты: #{p_id}"
+        caption = f"{celebration}{prefix}🎉 *НОВАЯ КАРТА!*\n\n⭐ Редкость: {rar.capitalize()}\n📝 {desc}\n🆔 Карты: #{p_id}"
 
     execute_query("UPDATE users SET last_foto_time = ? WHERE user_id = ?", (now.strftime("%Y-%m-%d %H:%M:%S"), user_id))
     await bot.send_photo(message.chat.id, f_id, caption=caption, parse_mode="Markdown")
