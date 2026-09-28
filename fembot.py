@@ -9,7 +9,7 @@ import re
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
-from aiogram.filters import Command, BaseFilter
+from aiogram.filters import Command, BaseFilter, or_f
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -49,11 +49,13 @@ def clean_surrogates(text: str) -> str:
     return fixed.encode("utf-8", "ignore").decode("utf-8")
 
 # ----------------------------------------------------------------------
-# КОНФИГУРАЦИЯ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# КОНФИГУРАЦИЯ И ПУТИ К БАЗЕ ДАННЫХ
 # ----------------------------------------------------------------------
 API_TOKEN = os.getenv("BOT_TOKEN", "")
 SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0"))
-DB_NAME = os.getenv("DB_PATH", "fembot_database.db")
+
+# Абсолютный путь к файлу БД, чтобы гарантировать постоянство данных при любых перезапусках
+DB_NAME = os.getenv("DB_PATH", os.path.abspath("fembot_database.db"))
 
 db_dir = os.path.dirname(DB_NAME)
 if db_dir:
@@ -75,11 +77,11 @@ RARITY_RAREST = "редчайший фем"
 # ----------------------------------------------------------------------
 # ОБНОВЛЕННЫЙ БАЛАНС ДРОПА (ШКАЛА 1000 ЕДИНИЦ)
 # ----------------------------------------------------------------------
-# Редкое:               580 / 1000 = 58.0%  (основная масса)
-# Ультра редкое:        280 / 1000 = 28.0%  (обычный дроп)
+# Редкое:               580 / 1000 = 58.0%  (основной дроп)
+# Ультра редкое:        280 / 1000 = 28.0%  (частый дроп)
 # Мифическое:           100 / 1000 = 10.0%  (приятная редкость)
-# Легендарное:           30 / 1000 =  3.0%  (тяжело выбить, 1 из ~33)
-# Фембойский артефакт:    9 / 1000 =  0.9%  (очень тяжело, меньше 1%)
+# Легендарное:           30 / 1000 =  3.0%  (тяжело выбить)
+# Фембойский артефакт:    9 / 1000 =  0.9%  (очень тяжело, < 1%)
 # Редчайший фем:          1 / 1000 =  0.1%  (джекпот, 1 из 1000!)
 DEFAULT_WEIGHTS = {
     RARITY_RARE: 580,
@@ -90,15 +92,13 @@ DEFAULT_WEIGHTS = {
     RARITY_RAREST: 1
 }
 
-# Веса под действием "Эликсира удачи" (шансы на топ-карты утраиваются,
-# но Редчайший фем всё равно остаётся редчайшей экзотикой - 0.3%)
 LUCKY_WEIGHTS = {
-    RARITY_RARE: 420,       # 42.0%
-    RARITY_ULTRA: 340,      # 34.0%
-    RARITY_MYTHIC: 160,     # 16.0%
-    RARITY_LEGENDARY: 60,   #  6.0% (в 2 раза чаще)
-    RARITY_ARTIFACT: 17,    #  1.7% (почти в 2 раза чаще)
-    RARITY_RAREST: 3        #  0.3% (в 3 раза чаще)
+    RARITY_RARE: 420,
+    RARITY_ULTRA: 340,
+    RARITY_MYTHIC: 160,
+    RARITY_LEGENDARY: 60,
+    RARITY_ARTIFACT: 17,
+    RARITY_RAREST: 3
 }
 
 RARITY_ORDER = {
@@ -122,11 +122,14 @@ CRAFT_PROGRESSION = [
 DEFAULT_AVATAR = "https://placehold.co/600x600/png?text=No+Avatar"
 
 # ----------------------------------------------------------------------
-# БАЗА ДАННЫХ (SQLITE)
+# БАЗА ДАННЫХ (SQLITE С WAL-РЕЖИМОМ ДЛЯ НАДЕЖНОГО СОХРАНЕНИЯ)
 # ----------------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+    # Включаем WAL-режим для защиты базы от сбоев при внезапных редеплоях
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -313,7 +316,8 @@ def get_user_coins(user_id):
 def add_coins(user_id, amount):
     execute_query("UPDATE users SET coins = MAX(0, coins + ?) WHERE user_id = ?", (amount, user_id))
 
-@dp.message(Command("daily"))
+# --- ЕЖЕДНЕВНЫЙ БОНУС (/daily ИЛИ "дейлик") ---
+@dp.message(or_f(Command("daily"), F.text.lower() == "дейлик"))
 async def cmd_daily(message: Message):
     user_id = message.from_user.id
     res = execute_query("SELECT last_daily, daily_streak FROM users WHERE user_id = ?", (user_id,), fetchone=True)
@@ -342,7 +346,8 @@ async def cmd_daily(message: Message):
         f"🎁 Награда получена! +{reward} коинов 🪙\nСерия: {new_streak} дн."
     )
 
-@dp.message(Command("shop"))
+# --- МАГАЗИН (/shop ИЛИ "магазин") ---
+@dp.message(or_f(Command("shop"), F.text.lower() == "магазин"))
 async def cmd_shop(message: Message):
     if message.chat.type != "private":
         return await message.reply("🛍 Магазин доступен только в личных сообщениях с ботом! Напишите мне там.")
@@ -380,7 +385,6 @@ async def buy_epic(call: CallbackQuery):
     if get_user_coins(user_id) < 350:
         return await call.answer("❌ Недостаточно коинов!", show_alert=True)
     
-    # В магазине продаются только Мифические, Легендарные и Артефакты (Редчайший фем там не падает)
     epic_pool = execute_query(
         "SELECT id, file_id, rarity, description FROM photos WHERE rarity IN (?, ?, ?)",
         (RARITY_MYTHIC, RARITY_LEGENDARY, RARITY_ARTIFACT),
@@ -411,9 +415,9 @@ async def buy_epic(call: CallbackQuery):
     await call.answer("Успешная покупка!")
 
 # ----------------------------------------------------------------------
-# СИНТЕЗ КАРТ (КРАФТ)
+# СИНТЕЗ КАРТ (/craft ИЛИ "крафт")
 # ----------------------------------------------------------------------
-@dp.message(Command("craft"))
+@dp.message(or_f(Command("craft"), F.text.lower() == "крафт"))
 async def cmd_craft(message: Message):
     if message.chat.type != "private":
         return await message.reply("🛠 Крафт доступен только в ЛС.")
@@ -476,8 +480,7 @@ async def do_craft(call: CallbackQuery):
 # ----------------------------------------------------------------------
 # ОСНОВНАЯ ИГРОВАЯ ЛОГИКА (/foto И ТРИГГЕРЫ)
 # ----------------------------------------------------------------------
-@dp.message(Command("foto"))
-@dp.message(F.text.lower() == "фем")
+@dp.message(or_f(Command("foto"), F.text.lower() == "фем"))
 async def handle_foto(message: Message):
     user_id = message.from_user.id
     now = datetime.now()
@@ -508,7 +511,6 @@ async def handle_foto(message: Message):
     else:
         weights = DEFAULT_WEIGHTS.copy()
 
-    # Выбираем категорию редкости на основе весов
     chosen = random.choices(list(weights.keys()), weights=list(weights.values()), k=1)[0]
     photo = execute_query("SELECT id, file_id, rarity, description FROM photos WHERE rarity = ? ORDER BY RANDOM() LIMIT 1", (chosen,), fetchone=True)
     if not photo:
@@ -525,7 +527,6 @@ async def handle_foto(message: Message):
     
     prefix = "🍀 *Эликсир удачи сработал!*\n" if is_lucky else ""
     
-    # Особое оповещение при выпадении джекпота
     if rar == RARITY_RAREST:
         celebration = "🌟🔥 **НЕВЕРОЯТНЫЙ ДЖЕКПОТ! ВЫБИТ РЕДЧАЙШИЙ ФЕМ (0.1%)!** 🔥🌟\n\n"
     elif rar == RARITY_ARTIFACT:
@@ -559,7 +560,7 @@ async def get_chest(call: CallbackQuery):
     await call.message.edit_text(f"🎉 Сундук открыл @{uname}!\nНаграда: {reward} 🪙")
 
 # ----------------------------------------------------------------------
-# ПРОФИЛЬ И КОЛЛЕКЦИЯ
+# ПРОФИЛЬ И КОЛЛЕКЦИЯ (/profil ИЛИ "профиль")
 # ----------------------------------------------------------------------
 async def show_profile_for_user(target_id: int, target_name: str, send_to_chat_id: int, reply_to_msg_id: int = None):
     res = execute_query("SELECT coins, luck_potion_expires, penalty_extra_hours, penalty_expires FROM users WHERE user_id = ?", (target_id,), fetchone=True)
@@ -591,8 +592,7 @@ async def show_profile_for_user(target_id: int, target_name: str, send_to_chat_i
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🖼 Коллекция", callback_data=f"view_coll_user:{target_id}:0")]])
     await bot.send_photo(send_to_chat_id, photo=avatar, caption=text, reply_markup=kb, parse_mode="Markdown", reply_to_message_id=reply_to_msg_id)
 
-@dp.message(Command("profil"))
-@dp.message(F.text.lower() == "профиль")
+@dp.message(or_f(Command("profil"), F.text.lower() == "профиль"))
 async def handle_profile(message: Message):
     uname = message.from_user.username or message.from_user.first_name
     await show_profile_for_user(message.from_user.id, uname, message.chat.id, message.message_id)
@@ -835,8 +835,7 @@ async def trade_init(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🤝 В ЛС", url=f"https://t.me/{me.username}?start=trade")]])
     await message.reply(f"🤝 Обмен с @{uname}! Механика в ЛС.", reply_markup=kb)
 
-@dp.message(Command("top"))
-@dp.message(F.text.lower().in_(["топ", "статистика"]))
+@dp.message(or_f(Command("top"), F.text.lower().in_(["топ", "статистика"])))
 async def cmd_top(message: Message):
     rows = execute_query(
         "SELECT u.username, u.user_id, SUM(up.count) as c, u.joined_at FROM users u LEFT JOIN user_photos up ON u.user_id = up.user_id GROUP BY u.user_id ORDER BY c DESC, u.joined_at ASC LIMIT 10",
@@ -907,8 +906,7 @@ async def activate_promo(message: Message):
     execute_query("UPDATE users SET last_foto_time = NULL WHERE user_id = ?", (user_id,))
     await message.reply("🎉 Промокод активирован! Кулдаун /foto сброшен.", parse_mode="Markdown")
 
-@dp.message(Command("admin"))
-@dp.message(F.text.lower() == "кто админ")
+@dp.message(or_f(Command("admin"), F.text.lower() == "кто админ"))
 async def cmd_admin_info(message: Message):
     res = execute_query("SELECT value FROM settings WHERE key = 'admin_info'", fetchone=True)
     text = fix_mojibake(res[0]) if res and res[0] else "Информация не настроена."
