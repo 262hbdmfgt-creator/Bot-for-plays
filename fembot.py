@@ -54,7 +54,7 @@ def clean_surrogates(text: str) -> str:
 API_TOKEN = os.getenv("BOT_TOKEN", "")
 SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0"))
 
-# Абсолютный путь к файлу БД, чтобы гарантировать постоянство данных при любых перезапусках
+# Абсолютный путь к файлу БД для гарантии сохранения данных при редеплоях
 DB_NAME = os.getenv("DB_PATH", os.path.abspath("fembot_database.db"))
 
 db_dir = os.path.dirname(DB_NAME)
@@ -75,14 +75,8 @@ RARITY_ARTIFACT = "фембойский артефакт"
 RARITY_RAREST = "редчайший фем"
 
 # ----------------------------------------------------------------------
-# ОБНОВЛЕННЫЙ БАЛАНС ДРОПА (ШКАЛА 1000 ЕДИНИЦ)
+# БАЛАНС ДРОПА (ШКАЛА 1000 ЕДИНИЦ)
 # ----------------------------------------------------------------------
-# Редкое:               580 / 1000 = 58.0%  (основной дроп)
-# Ультра редкое:        280 / 1000 = 28.0%  (частый дроп)
-# Мифическое:           100 / 1000 = 10.0%  (приятная редкость)
-# Легендарное:           30 / 1000 =  3.0%  (тяжело выбить)
-# Фембойский артефакт:    9 / 1000 =  0.9%  (очень тяжело, < 1%)
-# Редчайший фем:          1 / 1000 =  0.1%  (джекпот, 1 из 1000!)
 DEFAULT_WEIGHTS = {
     RARITY_RARE: 580,
     RARITY_ULTRA: 280,
@@ -122,12 +116,11 @@ CRAFT_PROGRESSION = [
 DEFAULT_AVATAR = "https://placehold.co/600x600/png?text=No+Avatar"
 
 # ----------------------------------------------------------------------
-# БАЗА ДАННЫХ (SQLITE С WAL-РЕЖИМОМ ДЛЯ НАДЕЖНОГО СОХРАНЕНИЯ)
+# БАЗА ДАННЫХ (SQLITE С WAL-РЕЖИМОМ ДЛЯ СОХРАНЕНИЯ ПРИ РЕДЕПЛОЯХ)
 # ----------------------------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Включаем WAL-режим для защиты базы от сбоев при внезапных редеплоях
     cursor.execute("PRAGMA journal_mode=WAL;")
     
     cursor.execute('''
@@ -673,7 +666,6 @@ async def admin_view_target_profile(message: Message):
         return await message.reply("⚠️ Укажите пользователя через @юзернейм или ответом на сообщение!")
     await show_profile_for_user(t_id, t_name, message.chat.id, message.message_id)
 
-# --- ПООЩРЕНИЕ: ВЫДАЧА КАРТЫ (ФОТО) ---
 @dp.message(F.text.lower().startswith(("/бот +карта", "!бот +карта", "/бот +фото", "!бот +фото")), IsAdminFilter())
 async def admin_add_card(message: Message):
     parts = message.text.split()
@@ -704,7 +696,6 @@ async def admin_add_card(message: Message):
         parse_mode="Markdown"
     )
 
-# --- ПООЩРЕНИЕ: ВЫДАЧА ФЕМКОИНОВ ---
 @dp.message(F.text.lower().startswith(("/бот +фемкоины", "!бот +фемкоины", "/бот +коины", "!бот +коины")), IsAdminFilter())
 async def admin_add_coins(message: Message):
     parts = message.text.split()
@@ -724,7 +715,6 @@ async def admin_add_coins(message: Message):
         parse_mode="Markdown"
     )
 
-# --- ПООЩРЕНИЕ: СБРОС КУЛДАУНА И СНЯТИЕ ШТРАФА (-КД) ---
 @dp.message(F.text.lower().startswith(("/бот -кд", "!бот -кд", "/бот сброс кд", "!бот сброс кд")), IsAdminFilter())
 async def admin_reset_cooldown(message: Message):
     parts = message.text.split()
@@ -744,7 +734,6 @@ async def admin_reset_cooldown(message: Message):
         parse_mode="Markdown"
     )
 
-# --- ШТРАФ: ИЗЪЯТИЕ КАРТЫ ---
 @dp.message(F.text.lower().startswith(("/бот -карта", "!бот -карта", "/бот -фото", "!бот -фото")), IsAdminFilter())
 async def admin_remove_card(message: Message):
     parts = message.text.split()
@@ -769,7 +758,6 @@ async def admin_remove_card(message: Message):
         
     await message.reply(f"🗑 Карта #{card_id} успешно изъята у игрока *{clean_surrogates(t_name)}*!", parse_mode="Markdown")
 
-# --- ШТРАФ: СПИСАНИЕ ФЕМКОИНОВ ---
 @dp.message(F.text.lower().startswith(("/бот -фемкоины", "!бот -фемкоины", "/бот -коины", "!бот -коины")), IsAdminFilter())
 async def admin_remove_coins(message: Message):
     parts = message.text.split()
@@ -786,7 +774,6 @@ async def admin_remove_coins(message: Message):
     new_bal = get_user_coins(t_id)
     await message.reply(f"💸 У игрока *{clean_surrogates(t_name)}* списано *{amount}* фемкоинов 🪙.\nТекущий баланс: *{new_bal}* 🪙", parse_mode="Markdown")
 
-# --- ШТРАФ: УВЕЛИЧЕНИЕ КУЛДАУНА (+КД) ---
 @dp.message(F.text.regexp(r"^[/!](?i:бот)\s+\+\d+\s*(?i:кд)"), IsAdminFilter())
 async def admin_penalty_kd(message: Message):
     text = message.text.strip()
@@ -817,6 +804,47 @@ async def admin_penalty_kd(message: Message):
         f"👤 Игрок: *{clean_surrogates(t_name)}*\n"
         f"⏳ Кулдаун: *{total_kd} ч.* (3 ч. + {extra_h} ч. штрафа)\n"
         f"⌛️ Срок действия штрафа: до *{exp_time}*",
+        parse_mode="Markdown"
+    )
+
+# ----------------------------------------------------------------------
+# АДМИНСКАЯ КОМАНДА: АЛЬБОМ ВСЕХ КАРТ ("/all card")
+# ----------------------------------------------------------------------
+@dp.message(or_f(Command("all_card", "allcard"), F.text.lower().in_(["/all card", "альбом карт", "все карты"])), IsAdminFilter())
+async def admin_all_cards_album(message: Message):
+    photos = execute_query("SELECT id, file_id, rarity, description FROM photos ORDER BY id ASC", fetchall=True)
+    if not photos:
+        return await message.reply("❌ В базе данных бота пока нет ни одной карты!")
+    
+    await message.reply(f"📂 Загрузка альбома всех карт в базе (всего: {len(photos)} шт.)...")
+    
+    # Telegram позволяет отправлять альбом (media group) максимум по 10 фото за раз
+    chunk_size = 10
+    for i in range(0, len(photos), chunk_size):
+        chunk = photos[i:i + chunk_size]
+        media_group = []
+        
+        for idx, (p_id, f_id, rar, desc) in enumerate(chunk):
+            clean_rar = fix_mojibake(rar).capitalize()
+            clean_desc = fix_mojibake(desc)
+            # Подпись добавляется к первой фотографии пачки
+            caption = f"🗂 Альбом карт (#{p_id})\n⭐ Редкость: {clean_rar}\n📝 {clean_desc}" if idx == 0 else f"#{p_id} ({clean_rar})"
+            media_group.append(InputMediaPhoto(media=f_id, caption=caption, parse_mode="Markdown"))
+            
+        try:
+            await message.answer_media_group(media=media_group)
+        except Exception as e:
+            await message.reply(f"⚠️ Ошибка при отправке пачки #{i//chunk_size + 1}: {e}")
+        
+        # Небольшая пауза между пачками, чтобы не словить Flood-wait от Telegram
+        if i + chunk_size < len(photos):
+            await asyncio.sleep(0.5)
+
+    # Отправляем отдельное сообщение с быстрой инструкцией по управлению
+    await message.reply(
+        "⚙️ *Управление картами из альбома:*\n\n"
+        "Для изменения или удаления конкретной карты используйте команду:\n"
+        "`/card ID` (например: `/card 5`)",
         parse_mode="Markdown"
     )
 
@@ -1097,7 +1125,7 @@ async def del_card_action(call: CallbackQuery):
     execute_query("DELETE FROM photos WHERE id = ?", (p_id,))
     execute_query("DELETE FROM user_photos WHERE photo_id = ?", (p_id,))
     await call.message.delete()
-    await call.answer(f"🗑 Карта #{p_id} удалена!", show_alert=True)
+    await call.answer(f"🗑 Карта #{p_id} удалена!", show_alt=True)
 
 # ----------------------------------------------------------------------
 # MINI APP (ВЕБ-ПРИЛОЖЕНИЕ В TELEGRAM)
