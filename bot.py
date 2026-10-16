@@ -1138,8 +1138,9 @@ async def delete_card(callback: CallbackQuery):
 # 5. Принудительный профиль
 @dp.message(F.text.lower().startswith("твой профиль"))
 async def forced_profile(message: Message):
-    if not await is_admin(message.from_user.id):
-        return
+    if message.from_user.id != SUPER_ADMIN_ID:
+      return
+  
 
     target_user = None
     if message.reply_to_message:
