@@ -1,12 +1,20 @@
 import asyncio
 import logging
+import os
 import random
+import socket
 import string
 import time
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
+from datetime import datetime
+from typing import Optional, List, Dict
+
+import aiohttp
+import aiosqlite
+from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -20,11 +28,12 @@ from aiogram.types import (
     LabeledPrice,
     PreCheckoutQuery,
 )
-import aiosqlite
 
-# ----------------- КОНФИГУРАЦИЯ -----------------
-BOT_TOKEN = "ВАШ_ТОКЕН_БОТА"
-SUPER_ADMIN_ID = 123456789  # Замените на ваш Telegram ID
+# Загружаем настройки из .env
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0").strip() or "0")
 DB_NAME = "fem_bot.db"
 
 logging.basicConfig(level=logging.INFO)
@@ -126,8 +135,8 @@ async def init_db():
         await db.execute("""
             CREATE TABLE IF NOT EXISTS promo_codes (
                 code TEXT PRIMARY KEY,
-                p_type TEXT, -- L или M
-                reward_type TEXT, -- f или k
+                p_type TEXT,
+                reward_type TEXT,
                 reward_val INTEGER,
                 expires_at REAL,
                 is_used INTEGER DEFAULT 0
@@ -165,7 +174,6 @@ async def init_db():
         """)
         await db.commit()
 
-# Хелперы работы с БД
 async def register_chat(chat_id: int, chat_type: str):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -208,11 +216,18 @@ async def add_log(admin_id: int, action: str):
         )
         await db.commit()
 
-# ----------------- БОТ И ДИСПЕТЧЕР -----------------
-bot = Bot(token=BOT_TOKEN)
+# ----------------- НАСТРОЙКА БОТА -----------------
+# Сессия с принудительным IPv4 и увеличенным таймаутом (решает зависание в Termux)
+connector = aiohttp.TCPConnector(family=socket.AF_INET)
+session = AiohttpSession(connector_type=connector, timeout=60.0)
+
+bot = Bot(
+    token=BOT_TOKEN,
+    session=session,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Мидлварь регистрации
 @dp.message.outer_middleware()
 async def register_middleware(handler, event: Message, data: dict):
     if event.from_user:
@@ -221,53 +236,50 @@ async def register_middleware(handler, event: Message, data: dict):
         await register_chat(event.chat.id, event.chat.type)
     return await handler(event, data)
 
-# ----------------- ПОЛЬЗОВАТЕЛЬСКИЙ БЛОК -----------------
+# ----------------- ПОЛЬЗОВАТЕЛИ -----------------
 
-# 1. /foto и триггер "фем"
+# 1. /foto или фем
 @dp.message(F.text.lower().in_(["/foto", "фем"]))
 async def fem_command(message: Message):
     uid = message.from_user.id
     now = time.time()
-    
+
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT last_fem_time, custom_cd_hours, custom_cd_expires, has_cd_reset, cd_reset_expires, luck_expires FROM users WHERE user_id = ?", (uid,)) as cur:
+        async with db.execute(
+            "SELECT last_fem_time, custom_cd_hours, custom_cd_expires, has_cd_reset, cd_reset_expires, luck_expires FROM users WHERE user_id = ?",
+            (uid,)
+        ) as cur:
             row = await cur.fetchone()
-        
+
         last_fem, custom_cd, custom_exp, has_reset, reset_exp, luck_exp = row
-        
-        # Проверка кд
+
         effective_cd = 3.0
         if custom_exp == -1 or custom_exp > now:
             effective_cd = custom_cd
-        
+
         cd_seconds = effective_cd * 3600
         time_passed = now - last_fem
-        
+
         if time_passed < cd_seconds:
-            # Проверяем, есть ли купленный сброс кд
             if has_reset and (reset_exp > now):
-                # Тратим сброс
                 await db.execute("UPDATE users SET has_cd_reset = 0 WHERE user_id = ?", (uid,))
                 await db.commit()
                 await message.reply("🔄 Использован купленный сброс ожидания! Крутим фото...")
             else:
                 rem = cd_seconds - time_passed
-                hours = int(rem // 3600)
-                minutes = int((rem % 3600) // 60)
-                seconds = int(rem % 60)
-                return await message.reply(f"⏳ Рано! До следующей попытки осталось: {hours}ч {minutes}м {seconds}с.")
+                h = int(rem // 3600)
+                m = int((rem % 3600) // 60)
+                s = int(rem % 60)
+                return await message.reply(f"⏳ Рано! До следующей попытки осталось: {h}ч {m}м {s}с.")
 
-        # Определение шансов (с учётом эликсира)
         is_lucky = luck_exp > now
         weights = LUCK_WEIGHTS if is_lucky else BASE_WEIGHTS
         chosen_rarity = random.choices(list(weights.keys()), weights=list(weights.values()))[0]
 
-        # Выбираем случайную карту этой редкости
         async with db.execute("SELECT id, file_id, description FROM cards WHERE rarity = ? ORDER BY RANDOM() LIMIT 1", (chosen_rarity,)) as cur:
             card = await cur.fetchone()
 
         if not card:
-            # Fallback на любую доступную карту
             async with db.execute("SELECT id, file_id, description, rarity FROM cards ORDER BY RANDOM() LIMIT 1") as cur:
                 card = await cur.fetchone()
                 if not card:
@@ -276,7 +288,6 @@ async def fem_command(message: Message):
 
         c_id, f_id, desc = card[0], card[1], card[2]
 
-        # Добавляем в инвентарь
         async with db.execute("SELECT count FROM inventory WHERE user_id = ? AND card_id = ?", (uid, c_id)) as cur:
             inv_row = await cur.fetchone()
             if inv_row:
@@ -296,7 +307,6 @@ async def fem_command(message: Message):
         f"{'<i>(Это дубликат! Пойдет на крафт или обмен)</i>' if is_dup else '🆕 <i>Новая карта в коллекции!</i>'}"
     )
 
-    # Инлайн кнопки под постом (настраиваемые в settings: user_post_buttons)
     kb = None
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM settings WHERE key = 'post_btn_url'") as cur:
@@ -304,9 +314,9 @@ async def fem_command(message: Message):
             if btn_row and btn_row[0]:
                 kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Присоединиться / Подробнее", url=btn_row[0])]])
 
-    await message.answer_photo(photo=f_id, caption=caption, parse_mode="HTML", reply_markup=kb)
+    await message.answer_photo(photo=f_id, caption=caption, reply_markup=kb)
 
-# 2. /profil и триггер "профиль"
+# 2. /profil или профиль
 @dp.message(F.text.lower().in_(["/profil", "профиль"]))
 async def profile_command(message: Message):
     await show_user_profile(message.chat.id, message.from_user, reply_to=message.message_id)
@@ -331,11 +341,10 @@ async def show_user_profile(chat_id: int, user: types.User, reply_to: int = None
     )
 
     if photos.total_count > 0:
-        await bot.send_photo(chat_id, photos.photos[0][-1].file_id, caption=caption, parse_mode="HTML", reply_markup=kb, reply_to_message_id=reply_to)
+        await bot.send_photo(chat_id, photos.photos[0][-1].file_id, caption=caption, reply_markup=kb, reply_to_message_id=reply_to)
     else:
-        await bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=kb, reply_to_message_id=reply_to)
+        await bot.send_message(chat_id, caption, reply_markup=kb, reply_to_message_id=reply_to)
 
-# Листалка карт в профиле
 @dp.callback_query(F.data.startswith("viewcards_"))
 async def browse_cards(callback: CallbackQuery):
     _, uid_str, idx_str = callback.data.split("_")
@@ -346,13 +355,6 @@ async def browse_cards(callback: CallbackQuery):
         return await callback.answer("Это не ваш профиль!", show_alert=True)
 
     async with aiosqlite.connect(DB_NAME) as db:
-        # Сортируем от самых редких к менее редким
-        await db.execute("""
-            SELECT c.id, c.file_id, c.rarity, c.description, inv.count
-            FROM inventory inv
-            JOIN cards c ON inv.card_id = c.id
-            WHERE inv.user_id = ?
-        """, (uid,))
         async with db.execute("""
             SELECT c.id, c.file_id, c.rarity, c.description, inv.count
             FROM inventory inv
@@ -364,12 +366,9 @@ async def browse_cards(callback: CallbackQuery):
     if not cards:
         return await callback.answer("У вас ещё нет карт!", show_alert=True)
 
-    # Сортируем в Python по убыванию ранга (от Редчайший фем к Редкое)
     cards.sort(key=lambda x: RARITY_ORDER.get(x[2], 0), reverse=True)
     idx = max(0, min(idx, len(cards) - 1))
-    c = cards[idx]
-
-    c_id, f_id, rarity, desc, cnt = c
+    c_id, f_id, rarity, desc, cnt = cards[idx]
 
     nav_btns = []
     if idx > 0:
@@ -388,29 +387,27 @@ async def browse_cards(callback: CallbackQuery):
 
     try:
         await callback.message.edit_media(
-            media=InputMediaPhoto(media=f_id, caption=text, parse_mode="HTML"),
+            media=InputMediaPhoto(media=f_id, caption=text),
             reply_markup=kb,
         )
     except Exception:
-        # Если было текстовое сообщение, удаляем и шлем фото
         await callback.message.delete()
-        await callback.message.answer_photo(photo=f_id, caption=text, parse_mode="HTML", reply_markup=kb)
+        await callback.message.answer_photo(photo=f_id, caption=text, reply_markup=kb)
     await callback.answer()
 
-# 3. /admin и триггер "кто админ"
+# 3. /admin или кто админ
 @dp.message(F.text.lower().in_(["/admin", "кто админ"]))
 async def who_admin(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM settings WHERE key = 'admin_info'") as cur:
             row = await cur.fetchone()
     text = row[0] if row else "Администратор ещё не настроил информацию о себе."
-    await message.reply(text, parse_mode="HTML")
+    await message.reply(text)
 
-# 4. /craft и триггер "крафт"
+# 4. /craft или крафт
 @dp.message(F.text.lower().in_(["/craft", "крафт"]))
 async def craft_command(message: Message):
     uid = message.from_user.id
-    # Ищем редкости, где сумма карт >= 3
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("""
             SELECT c.rarity, SUM(inv.count) as total
@@ -432,7 +429,7 @@ async def craft_command(message: Message):
     if not buttons:
         return await message.reply("❌ У вас есть дубликаты только максимальной редкости, их нельзя улучшить!")
 
-    await message.reply("⚒ <b>Выберите редкость карт для скрещивания 3-в-1:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    await message.reply("⚒ <b>Выберите редкость карт для скрещивания 3-в-1:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 @dp.callback_query(F.data.startswith("do_craft_"))
 async def execute_craft(callback: CallbackQuery):
@@ -442,7 +439,6 @@ async def execute_craft(callback: CallbackQuery):
     target_rarity = RARITIES[current_idx + 1]
 
     async with aiosqlite.connect(DB_NAME) as db:
-        # Извлекаем 3 карты
         async with db.execute("""
             SELECT inv.id, inv.card_id, inv.count 
             FROM inventory inv
@@ -453,8 +449,7 @@ async def execute_craft(callback: CallbackQuery):
             rows = await cur.fetchall()
 
         needed = 3
-        taken_ids = []
-        for r_id, c_id, count in rows:
+        for r_id, _, count in rows:
             take = min(needed, count)
             if take == count:
                 await db.execute("DELETE FROM inventory WHERE id = ?", (r_id,))
@@ -467,15 +462,12 @@ async def execute_craft(callback: CallbackQuery):
         if needed > 0:
             return await callback.answer("Недостаточно карт для крафта!", show_alert=True)
 
-        # Проверяем лотерею для Легендарных и выше
         is_lottery = current_idx >= RARITY_ORDER["Легендарное"]
         success = True
         lottery_coins = 0
         if is_lottery:
-            # 35% шанс успеха
             if random.random() > 0.35:
                 success = False
-                # Награда фемкоинов 50..350
                 lottery_coins = random.choices([50, 100, 150, 200, 350], weights=[40, 25, 18, 12, 5])[0]
                 await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (lottery_coins, uid))
 
@@ -485,7 +477,7 @@ async def execute_craft(callback: CallbackQuery):
             if not new_card:
                 await db.rollback()
                 return await callback.message.edit_text(f"❌ В базе пока нет карт ранга {target_rarity}! Карты не были списаны.")
-            
+
             c_id, f_id, desc = new_card
             async with db.execute("SELECT id FROM inventory WHERE user_id = ? AND card_id = ?", (uid, c_id)) as cur:
                 exists = await cur.fetchone()
@@ -494,7 +486,7 @@ async def execute_craft(callback: CallbackQuery):
                 else:
                     await db.execute("INSERT INTO inventory (user_id, card_id, count) VALUES (?, ?, 1)", (uid, c_id))
             await db.commit()
-            
+
             text = (
                 f"🎉 <b>УСПЕШНЫЙ КРАФТ!</b>\n\n"
                 f"Скрестив 3 карты ранга <i>{rarity}</i>, вы получили:\n"
@@ -502,24 +494,23 @@ async def execute_craft(callback: CallbackQuery):
                 f"📝 {desc}"
             )
             await callback.message.delete()
-            await callback.message.answer_photo(photo=f_id, caption=text, parse_mode="HTML")
+            await callback.message.answer_photo(photo=f_id, caption=text)
         else:
             await db.commit()
             await callback.message.edit_text(
                 f"💥 <b>Крафт не удался!</b>\n"
                 f"Слияние карт ранга <i>{rarity}</i> оказалось нестабильным, но вы извлекли чистую энергию: "
-                f"<b>+{lottery_coins} 🪙 фемкоинов!</b>",
-                parse_mode="HTML"
+                f"<b>+{lottery_coins} 🪙 фемкоинов!</b>"
             )
 
-# 5. Трейд (Ответ на сообщение)
+# 5. Трейд
 trades: Dict[str, dict] = {}
 
 @dp.message(F.text.lower().startswith("трейд"))
 async def trade_init(message: Message):
     if not message.reply_to_message or not message.reply_to_message.from_user:
         return await message.reply("❗ Команда должна быть ответом на сообщение игрока, с которым вы хотите обменяться!")
-    
+
     sender = message.from_user
     receiver = message.reply_to_message.from_user
 
@@ -545,7 +536,6 @@ async def trade_init(message: Message):
         f"🤝 <b>{sender.full_name}</b> предлагает обмен картами игроку <b>{receiver.full_name}</b>!\n"
         f"<i>Правило: меняться можно только картами равной редкости, и только повторными (единственную отдать нельзя)!</i>",
         reply_markup=kb,
-        parse_mode="HTML",
     )
 
 @dp.callback_query(F.data.startswith("trade_accept_"))
@@ -562,7 +552,7 @@ async def trade_accepted(callback: CallbackQuery):
         [InlineKeyboardButton(text=f"Выбрать карту ({t['p2_name']})", callback_data=f"tr_pick_{trade_id}_{t['p2']}")],
         [InlineKeyboardButton(text="✅ Подтвердить обмен", callback_data=f"tr_confirm_{trade_id}")]
     ])
-    await callback.message.edit_text("🔄 <b>Окно обмена открыто!</b> Оба игрока должны выбрать карту дубликат одинаковой редкости.", reply_markup=kb, parse_mode="HTML")
+    await callback.message.edit_text("🔄 <b>Окно обмена открыто!</b> Оба игрока должны выбрать карту дубликат одинаковой редкости.", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("tr_pick_"))
 async def trade_pick(callback: CallbackQuery):
@@ -571,7 +561,6 @@ async def trade_pick(callback: CallbackQuery):
     if callback.from_user.id != uid:
         return await callback.answer("Это кнопка для другого игрока!", show_alert=True)
 
-    # Ищем карты, где count > 1 (только повторы!)
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("""
             SELECT c.id, c.rarity, inv.count
@@ -628,7 +617,6 @@ async def trade_confirm(callback: CallbackQuery):
     if not (t["p1_ok"] and t["p2_ok"]):
         return await callback.answer("Ожидание подтверждения второго участника!", show_alert=True)
 
-    # Проверяем одинаковость редкостей
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT rarity FROM cards WHERE id = ?", (t["p1_card"],)) as cur:
             r1 = (await cur.fetchone())[0]
@@ -638,7 +626,6 @@ async def trade_confirm(callback: CallbackQuery):
         if r1 != r2:
             return await callback.message.reply(f"❌ Обмен невозможен! Редкости не совпадают ({r1} ≠ {r2}).")
 
-        # Передаем карты: у P1 забираем P1_card, добавляем P2_card. У P2 наоборот.
         await db.execute("UPDATE inventory SET count = count - 1 WHERE user_id = ? AND card_id = ?", (t["p1"], t["p1_card"]))
         await db.execute("UPDATE inventory SET count = count - 1 WHERE user_id = ? AND card_id = ?", (t["p2"], t["p2_card"]))
 
@@ -653,9 +640,9 @@ async def trade_confirm(callback: CallbackQuery):
         await db.commit()
 
     del trades[trade_id]
-    await callback.message.edit_text("🎉 <b>Обмен успешно завершён!</b> Игроки обменялись картами равной редкости.", parse_mode="HTML")
+    await callback.message.edit_text("🎉 <b>Обмен успешно завершён!</b> Игроки обменялись картами равной редкости.")
 
-# 6. Дейлик (Ежедневная серия)
+# 6. Дейлик
 @dp.message(F.text.lower().in_(["дейлик", "/daily"]))
 async def daily_command(message: Message):
     uid = message.from_user.id
@@ -674,7 +661,7 @@ async def daily_command(message: Message):
         if diff <= 86400 * 2:
             streak += 1
         else:
-            streak = 1  # Серия сгорела
+            streak = 1
 
         streak = min(streak, 30)
         reward = 20 + (streak * 10)
@@ -690,11 +677,10 @@ async def daily_command(message: Message):
         f"📅 <b>Ежедневная награда получена!</b>\n\n"
         f"🔥 <b>Ваша текущая серия:</b> {streak} дн.\n"
         f"💰 <b>Начислено:</b> +{reward} 🪙 фемкоинов!\n"
-        f"<i>Не пропускайте дни, чтобы увеличивать бонус!</i>",
-        parse_mode="HTML"
+        f"<i>Не пропускайте дни, чтобы увеличивать бонус!</i>"
     )
 
-# 7. Топ 10 игроков и Топ 100
+# 7. Топ 10 / топ 100
 @dp.message(F.text.lower().in_(["/top", "топ"]))
 async def top_command(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -715,7 +701,7 @@ async def top_command(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📜 Показать ТОП 100 в ЛС", callback_data="top_100_dm")]
     ])
-    await message.reply(text, reply_markup=kb, parse_mode="HTML")
+    await message.reply(text, reply_markup=kb)
 
 @dp.callback_query(F.data == "top_100_dm")
 async def send_top_100(callback: CallbackQuery):
@@ -735,13 +721,12 @@ async def send_top_100(callback: CallbackQuery):
         text += f"{i}. {uname or 'Аноним'} — {total} шт.\n"
 
     try:
-        await bot.send_message(callback.from_user.id, text, parse_mode="HTML")
+        await bot.send_message(callback.from_user.id, text)
         await callback.answer("Топ 100 отправлен вам в ЛС!", show_alert=True)
     except Exception:
-        bot_user = await bot.get_me()
         await callback.answer("Сначала откройте диалог с ботом!", show_alert=True)
 
-# 8. /shop и триггер "магазин" (Только в ЛС)
+# 8. /shop или магазин
 @dp.message(F.text.lower().in_(["/shop", "магазин"]))
 async def shop_command(message: Message):
     bot_info = await bot.get_me()
@@ -766,21 +751,19 @@ async def shop_command(message: Message):
     await message.reply(
         f"🏪 <b>Магазин предметов</b>\n\n"
         f"Ваш баланс: <b>{coins} 🪙 фемкоинов</b>\n\n"
-        f"• <b>Сброс КД:</b> сбрасывает 3-часовой кулдаун на вызов фото (сгорает через 3ч если не использовать).\n"
+        f"• <b>Сброс КД:</b> сбрасывает ожидание 3ч (сгорает через 3ч, если не использовать).\n"
         f"• <b>Эликсир удачи:</b> повышает шансы на редкие ранги на 3 часа.\n"
-        f"• <b>Новая карта:</b> гарантированно выдает карту, которой у вас еще нет!\n"
-        f"• <b>Звезды Telegram:</b> пополнение запаса фемкоинов.",
+        f"• <b>Новая карта:</b> гарантированно дает карту, которой у вас еще нет!\n"
+        f"• <b>TG Stars:</b> покупка валюты напрямую за звезды.",
         reply_markup=kb,
-        parse_mode="HTML"
     )
 
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     if len(message.text.split()) > 1 and message.text.split()[1] == "shop":
         return await shop_command(message)
-    await message.reply("👋 Привет! Я игровой бот по сбору коллекционных карт! Напиши <b>фем</b> или /foto, чтобы начать.", parse_mode="HTML")
+    await message.reply("👋 Привет! Я игровой бот. Напиши <b>фем</b> или /foto, чтобы начать.")
 
-# Покупки за фемкоины
 @dp.callback_query(F.data == "buy_cd_reset")
 async def buy_cd(callback: CallbackQuery):
     uid = callback.from_user.id
@@ -796,7 +779,7 @@ async def buy_cd(callback: CallbackQuery):
             WHERE user_id = ?
         """, (now + 3 * 3600, uid))
         await db.commit()
-    await callback.answer("Сброс КД куплен! Он будет автоматически потрачен при следующем вызове 'фем'.", show_alert=True)
+    await callback.answer("Сброс КД куплен! Он потратится при следующем вызове 'фем'.", show_alert=True)
 
 @dp.callback_query(F.data == "buy_luck")
 async def buy_luck(callback: CallbackQuery):
@@ -839,10 +822,9 @@ async def buy_new_card(callback: CallbackQuery):
         await db.execute("INSERT INTO inventory (user_id, card_id, count) VALUES (?, ?, 1)", (uid, c_id))
         await db.commit()
 
-    await callback.message.answer_photo(photo=f_id, caption=f"🎁 <b>Куплена новая карта #{c_id}!</b>\nРедкость: {rarity}\n{desc}", parse_mode="HTML")
+    await callback.message.answer_photo(photo=f_id, caption=f"🎁 <b>Куплена новая карта #{c_id}!</b>\nРедкость: {rarity}\n{desc}")
     await callback.answer()
 
-# Telegram Stars инвойсы
 @dp.callback_query(F.data.startswith("stars_"))
 async def buy_stars_invoice(callback: CallbackQuery):
     amount = int(callback.data.replace("stars_", ""))
@@ -855,7 +837,7 @@ async def buy_stars_invoice(callback: CallbackQuery):
         payload=f"buy_coins_{amount}",
         currency="XTR",
         prices=prices,
-        provider_token="",  # Для Telegram Stars оставляется пустым
+        provider_token="",
     )
     await callback.answer()
 
@@ -871,12 +853,12 @@ async def successful_payment_handler(message: Message):
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (coins_to_add, message.from_user.id))
             await db.commit()
-        await message.reply(f"⭐ Оплата прошла успешно! Вам начислено <b>+{coins_to_add} 🪙 фемкоинов</b>.", parse_mode="HTML")
+        await message.reply(f"⭐ Оплата прошла успешно! Начислено <b>+{coins_to_add} 🪙 фемкоинов</b>.")
 
-# 9. /promo (Активация промокода)
+# 9. /promo
 @dp.message(Command("promo"))
 async def promo_command(message: Message, state: FSMContext):
-    await message.reply("🔑 Пожалуйста, отправьте промокод следующим сообщением:")
+    await message.reply("🔑 Отправьте промокод следующим сообщением:")
     await state.set_state(UserStates.waiting_for_promo_code)
 
 @dp.message(UserStates.waiting_for_promo_code)
@@ -908,7 +890,6 @@ async def process_promo(message: Message, state: FSMContext):
                 await state.clear()
                 return await message.reply("❌ Вы уже активировали этот промокод!")
 
-        # Активация
         if r_type == "f":
             await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (r_val, uid))
             reward_msg = f"+{r_val} 🪙 фемкоинов"
@@ -923,9 +904,9 @@ async def process_promo(message: Message, state: FSMContext):
         await db.commit()
 
     await state.clear()
-    await message.reply(f"🎉 Промокод успешно активирован! Ваша награда: <b>{reward_msg}</b>", parse_mode="HTML")
+    await message.reply(f"🎉 Промокод успешно активирован! Ваша награда: <b>{reward_msg}</b>")
 
-# 10. Казино /kaz и "казино"
+# 10. /kaz или казино
 @dp.message(F.text.lower().in_(["/kaz", "казино"]))
 async def casino_menu(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -934,7 +915,7 @@ async def casino_menu(message: Message):
         [InlineKeyboardButton(text="🟢 Зеро (x14, 50 🪙)", callback_data="kaz_roul_zero")],
         [InlineKeyboardButton(text="🎰 Слоты 777 (Ставка 30 🪙)", callback_data="kaz_slots_30")]
     ])
-    await message.reply("🎰 <b>Добро пожаловать в Фем-Казино!</b>\nИспытайте свою удачу в играх ниже:", reply_markup=kb, parse_mode="HTML")
+    await message.reply("🎰 <b>Добро пожаловать в Фем-Казино!</b>\nИспытайте свою удачу в играх ниже:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("kaz_"))
 async def casino_play(callback: CallbackQuery):
@@ -948,31 +929,24 @@ async def casino_play(callback: CallbackQuery):
         if act == "kaz_dice_20":
             if coins < 20:
                 return await callback.answer("Не хватает фемкоинов!", show_alert=True)
-            user_roll = random.randint(1, 6)
-            bot_roll = random.randint(1, 6)
-            if user_roll > bot_roll:
-                win = 40
+            u_roll = random.randint(1, 6)
+            b_roll = random.randint(1, 6)
+            if u_roll > b_roll:
                 await db.execute("UPDATE users SET femcoins = femcoins + 20 WHERE user_id = ?", (uid,))
-                res = f"Вы выиграли! ({user_roll} против {bot_roll} у бота). Награда: +20 🪙"
-            elif user_roll < bot_roll:
+                res = f"Вы выиграли! ({u_roll} против {b_roll} у бота). Награда: +20 🪙"
+            elif u_roll < b_roll:
                 await db.execute("UPDATE users SET femcoins = femcoins - 20 WHERE user_id = ?", (uid,))
-                res = f"Вы проиграли! ({user_roll} против {bot_roll} у бота). -20 🪙"
+                res = f"Вы проиграли! ({u_roll} против {b_roll} у бота). -20 🪙"
             else:
-                res = f"Ничья! ({user_roll} и {bot_roll}). Монеты сохранены."
+                res = f"Ничья! ({u_roll} и {b_roll}). Монеты сохранены."
 
         elif act.startswith("kaz_roul_"):
             choice = act.replace("kaz_roul_", "")
             if coins < 50:
                 return await callback.answer("Нужно минимум 50 монет!", show_alert=True)
-            
-            # Рулетка 0-36 (0 - зеро, 1-18 red, 19-36 black)
+
             num = random.randint(0, 36)
-            if num == 0:
-                color = "zero"
-            elif num % 2 == 1:
-                color = "red"
-            else:
-                color = "black"
+            color = "zero" if num == 0 else ("red" if num % 2 == 1 else "black")
 
             if choice == color:
                 mult = 14 if choice == "zero" else 2
@@ -989,11 +963,9 @@ async def casino_play(callback: CallbackQuery):
             emojis = ["🍒", "🍋", "🍇", "💎", "7️⃣"]
             s1, s2, s3 = random.choices(emojis, k=3)
             if s1 == s2 == s3 == "7️⃣":
-                win = 500
                 await db.execute("UPDATE users SET femcoins = femcoins + 470 WHERE user_id = ?", (uid,))
                 res = f"[{s1}|{s2}|{s3}] ДЖЕКПОТ 777! +470 🪙!"
             elif s1 == s2 == s3:
-                win = 150
                 await db.execute("UPDATE users SET femcoins = femcoins + 120 WHERE user_id = ?", (uid,))
                 res = f"[{s1}|{s2}|{s3}] ТРИ В РЯД! +120 🪙!"
             else:
@@ -1005,9 +977,8 @@ async def casino_play(callback: CallbackQuery):
     await callback.message.reply(res)
     await callback.answer()
 
-# ----------------- БЛОК АДМИНИСТРАЦИИ -----------------
+# ----------------- АДМИНИСТРАЦИЯ -----------------
 
-# 1. /plus_foto
 @dp.message(Command("plus_foto"))
 async def plus_foto_cmd(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
@@ -1019,7 +990,6 @@ async def plus_foto_cmd(message: Message, state: FSMContext):
 async def process_admin_photo(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id
     await state.update_data(file_id=photo_id)
-
     btns = [[InlineKeyboardButton(text=r, callback_data=f"setrar_{r}")] for r in RARITIES]
     await message.reply("Выберите редкость для этой карты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
@@ -1046,7 +1016,6 @@ async def process_admin_desc(message: Message, state: FSMContext):
     await state.clear()
     await message.reply(f"✅ Карта #{card_id} успешно создана и добавлена в базу!")
 
-# 2. all card и 100 card (Отправка альбомами)
 @dp.message(F.text.lower().in_(["all card", "100 card"]))
 async def view_cards_album(message: Message):
     if not await is_admin(message.from_user.id):
@@ -1060,17 +1029,12 @@ async def view_cards_album(message: Message):
     if not cards:
         return await message.reply("В базе нет карт.")
 
-    # Альбомы в TG отправляются порциями по 2-10 штук
     for i in range(0, len(cards), 10):
         chunk = cards[i:i+10]
-        media_group = [
-            InputMediaPhoto(media=c[1], caption=f"ID: {c[0]} | {c[2]}")
-            for c in chunk
-        ]
+        media_group = [InputMediaPhoto(media=c[1], caption=f"ID: {c[0]} | {c[2]}") for c in chunk]
         await message.answer_media_group(media=media_group)
         await asyncio.sleep(0.5)
 
-# 4. /card <id>
 @dp.message(F.text.regexp(r"^/card\s+(\d+)$"))
 async def card_manage(message: Message):
     if not await is_admin(message.from_user.id):
@@ -1084,7 +1048,6 @@ async def card_manage(message: Message):
         if not card:
             return await message.reply(f"Карта #{c_id} не найдена.")
 
-        # Статистика
         async with db.execute("SELECT COUNT(DISTINCT user_id), SUM(count) FROM inventory WHERE card_id = ?", (c_id,)) as cur:
             stats = await cur.fetchone()
             unique_owners = stats[0] or 0
@@ -1104,7 +1067,7 @@ async def card_manage(message: Message):
         [InlineKeyboardButton(text="📝 Изменить описание", callback_data=f"editdesc_{c_id}")],
         [InlineKeyboardButton(text="🗑 Удалить карту", callback_data=f"delcard_{c_id}")]
     ])
-    await message.answer_photo(photo=f_id, caption=caption, parse_mode="HTML", reply_markup=kb)
+    await message.answer_photo(photo=f_id, caption=caption, reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("editrar_"))
 async def edit_card_rarity(callback: CallbackQuery):
@@ -1128,19 +1091,16 @@ async def delete_card(callback: CallbackQuery):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM cards WHERE id = ?", (c_id,))
         await db.execute("DELETE FROM inventory WHERE card_id = ?", (c_id,))
-        # Сдвиг ID
         await db.execute("UPDATE cards SET id = id - 1 WHERE id > ?", (c_id,))
         await db.execute("UPDATE inventory SET card_id = card_id - 1 WHERE card_id > ?", (c_id,))
         await db.commit()
     await add_log(callback.from_user.id, f"Удалена карта #{c_id} со сдвигом ID")
     await callback.message.edit_text(f"🗑 Карта #{c_id} удалена, номера последующих карт сдвинуты на -1.")
 
-# 5. Принудительный профиль
 @dp.message(F.text.lower().startswith("твой профиль"))
 async def forced_profile(message: Message):
-    if message.from_user.id != SUPER_ADMIN_ID:
-      return
-  
+    if not await is_admin(message.from_user.id):
+        return
 
     target_user = None
     if message.reply_to_message:
@@ -1162,7 +1122,6 @@ async def forced_profile(message: Message):
 
 # ----------------- СУПЕР АДМИНИСТРАТОР -----------------
 
-# 1. /admins
 @dp.message(Command("admins"))
 async def list_admins(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -1191,7 +1150,6 @@ async def remove_adm_cb(callback: CallbackQuery):
         await db.commit()
     await callback.message.edit_text(f"Администратор {uid} успешно снят.")
 
-# 2. Рассылка /add ... /save
 broadcast_buffer: Dict[int, List[Message]] = {}
 
 @dp.message(Command("add"))
@@ -1230,10 +1188,10 @@ async def collect_broadcast(message: Message, state: FSMContext):
     broadcast_buffer[message.from_user.id].append(message)
     await message.reply("Сообщение добавлено в буфер рассылки.")
 
-# 3. Инвайт код для админа
+# ТОЛЬКО СУПЕР АДМИН МОЖЕТ ГЕНЕРИРОВАТЬ КОД:
 @dp.message(Command("now_admin_cod"))
 async def gen_admin_code(message: Message):
-    if not await is_admin(message.from_user.id):
+    if message.from_user.id != SUPER_ADMIN_ID:
         return
 
     digits = "".join(random.choices(string.digits, k=7))
@@ -1247,7 +1205,7 @@ async def gen_admin_code(message: Message):
         await db.execute("INSERT INTO admin_codes (code, created_by, expires_at) VALUES (?, ?, ?)", (code, message.from_user.id, exp))
         await db.commit()
 
-    await message.reply(f"🔑 Одноразовый код администратора: <code>{code}</code>\nДействует 3 часа.", parse_mode="HTML")
+    await message.reply(f"🔑 Одноразовый код администратора: <code>{code}</code>\nДействует 3 часа.")
 
 @dp.message(Command("I_am_admin"))
 async def claim_admin(message: Message, state: FSMContext):
@@ -1274,13 +1232,11 @@ async def check_admin_code(message: Message, state: FSMContext):
     await add_log(message.from_user.id, "Стал администратором через код")
     await message.reply("🎉 Поздравляем! Вы получили права администратора бота.")
 
-# 4. Создание промокодов /create_p
 @dp.message(F.text.startswith("/create_p"))
 async def create_promo_cmd(message: Message, state: FSMContext):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
     parts = message.text.split()
-    # /create_p L/M f coins hours ИЛИ /create_p L/M k hours
     if len(parts) < 4:
         return await message.reply("Формат:\n/create_p <L/M> <f/k> <монеты> <часы>\nили\n/create_p <L/M> k <часы>")
 
@@ -1314,7 +1270,7 @@ async def promo_auto(callback: CallbackQuery, state: FSMContext):
         """, (code, data["p_type"], data["r_type"], data["r_val"], data["exp"]))
         await db.commit()
     await state.clear()
-    await callback.message.edit_text(f"✅ Промокод успешно создан: <code>{code}</code>", parse_mode="HTML")
+    await callback.message.edit_text(f"✅ Промокод успешно создан: <code>{code}</code>")
 
 @dp.callback_query(F.data == "gen_promo_manual")
 async def promo_manual(callback: CallbackQuery, state: FSMContext):
@@ -1332,9 +1288,8 @@ async def promo_manual_save(message: Message, state: FSMContext):
         """, (code, data["p_type"], data["r_type"], data["r_val"], data["exp"]))
         await db.commit()
     await state.clear()
-    await message.reply(f"✅ Промокод сохранен: <code>{code}</code>", parse_mode="HTML")
+    await message.reply(f"✅ Промокод сохранен: <code>{code}</code>")
 
-# 5. /log
 @dp.message(Command("log"))
 async def view_logs(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -1351,9 +1306,8 @@ async def view_logs(message: Message):
         dt = datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
         text += f"[{dt}] <b>Admin {a_id}:</b> {act}\n"
 
-    await message.reply(text, parse_mode="HTML")
+    await message.reply(text)
 
-# Хелпер для извлечения целевого пользователя в командах /бот ...
 async def resolve_target(message: Message, arg_index: int = -1) -> Optional[int]:
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user.id
@@ -1366,7 +1320,6 @@ async def resolve_target(message: Message, arg_index: int = -1) -> Optional[int]
                 return row[0] if row else None
     return None
 
-# 6. /бот +коины и -коины
 @dp.message(F.text.startswith("/бот +коины") | F.text.startswith("/бот -коины"))
 async def mod_coins(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -1388,7 +1341,6 @@ async def mod_coins(message: Message):
     await add_log(message.from_user.id, f"{'+' if is_plus else '-'}{amount} коинов юзеру {target_id}")
     await message.reply(f"Баланс игрока {target_id} изменен на {'+' if is_plus else '-'}{amount} 🪙.")
 
-# 7. /бот +карта и -карта
 @dp.message(F.text.startswith("/бот +карта") | F.text.startswith("/бот -карта"))
 async def mod_cards(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -1417,7 +1369,6 @@ async def mod_cards(message: Message):
     await add_log(message.from_user.id, action_desc)
     await message.reply(f"Готово: {action_desc}.")
 
-# 8. /бот кд <ч> <срок>
 @dp.message(F.text.startswith("/бот кд"))
 async def mod_cd(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -1442,7 +1393,6 @@ async def mod_cd(message: Message):
     await add_log(message.from_user.id, f"Установлен КД {new_cd}ч игроку {target_id} на {duration_hours}ч")
     await message.reply(f"Игроку {target_id} установлен КД {new_cd} ч на {duration_hours} ч.")
 
-# 9. /set_adm_text
 @dp.message(Command("set_adm_text"))
 async def set_adm_text_cmd(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
@@ -1463,6 +1413,10 @@ async def save_adm_text(message: Message, state: FSMContext):
 # ----------------- ЗАПУСК -----------------
 async def main():
     await init_db()
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"Webhook reset warning: {e}")
     logger.info("База данных инициализирована. Бот запущен!")
     await dp.start_polling(bot)
 
