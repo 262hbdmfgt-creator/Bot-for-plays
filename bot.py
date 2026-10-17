@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -217,9 +218,13 @@ async def add_log(admin_id: int, action: str):
         await db.commit()
 
 # ----------------- НАСТРОЙКА БОТА -----------------
-# Сессия с принудительным IPv4 и увеличенным таймаутом (решает зависание в Termux)
-connector = aiohttp.TCPConnector(family=socket.AF_INET)
-session = AiohttpSession(connector_type=connector, timeout=60.0)
+# Подключение через стабильный пул с защитой от тайм-аута
+connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
+session = AiohttpSession(
+    api=TelegramAPIServer.from_base("https://api.telegram.org"),
+    connector_type=connector,
+    timeout=90.0
+)
 
 bot = Bot(
     token=BOT_TOKEN,
