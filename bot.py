@@ -212,7 +212,7 @@ async def get_user_display_name(user_id: int) -> str:
             row = await cur.fetchone()
             if row and row[0]:
                 uname = row[0]
-                return f"@{uname}" if not uname.startswith("@") and not " " in uname else uname
+                return f"@{uname}" if not uname.startswith("@") and " " not in uname else uname
     return f"ID:{user_id}"
 
 async def is_admin(user_id: int) -> bool:
@@ -230,11 +230,24 @@ async def add_log(admin_id: int, action: str):
         )
         await db.commit()
 
-# ----------------- НАСТРОЙКА БОТА -----------------
-connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
-session = AiohttpSession(
+# ----------------- НАСТРОЙКА СЕТИ (СОВМЕСТИМО С PYTHON 3.14) -----------------
+class TermuxAiohttpSession(AiohttpSession):
+    """
+    Кастомная сессия: коннектор создается ТОЛЬКО внутри запущенного event loop,
+    что полностью исключает ошибку RuntimeError: no running event loop в Python 3.14
+    """
+    async def create_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                json_serialize=self.json_dumps,
+            )
+        return self._session
+
+session = TermuxAiohttpSession(
     api=TelegramAPIServer.from_base("https://api.telegram.org"),
-    connector_type=connector,
     timeout=90.0
 )
 
@@ -337,7 +350,6 @@ async def fem_command(message: Message):
     if random.random() < 0.10:
         await asyncio.sleep(0.8)
         chest_id = f"ch_{int(time.time() * 1000)}_{random.randint(100, 999)}"
-        # Взвешенные награды: 15..90 коинов
         reward_coins = random.choices([15, 25, 40, 60, 90], weights=[50, 25, 15, 7, 3])[0]
         active_chests[chest_id] = {
             "coins": reward_coins,
@@ -979,7 +991,7 @@ async def process_promo(message: Message, state: FSMContext):
     await state.clear()
     await message.reply(f"🎉 Промокод успешно активирован! Ваша награда: <b>{reward_msg}</b>")
 
-# 10. /kaz или казино (С выводом юзернейма игрока в отчёт)
+# 10. /kaz или казино
 @dp.message(F.text.lower().in_(["/kaz", "казино"]))
 async def casino_menu(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1199,7 +1211,6 @@ async def forced_profile(message: Message):
 
 # ----------------- СУПЕР АДМИНИСТРАТОР -----------------
 
-# /admins с отображением Юзернеймов
 @dp.message(Command("admins"))
 async def list_admins(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -1370,7 +1381,6 @@ async def promo_manual_save(message: Message, state: FSMContext):
     await state.clear()
     await message.reply(f"✅ Промокод сохранен: <code>{code}</code>")
 
-# /log с выводом Юзернеймов
 @dp.message(Command("log"))
 async def view_logs(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -1402,7 +1412,6 @@ async def resolve_target(message: Message, arg_index: int = -1) -> Optional[int]
                 return row[0] if row else None
     return None
 
-# Выдача/снятие коинов с выводом юзернейма
 @dp.message(F.text.startswith("/бот +коины") | F.text.startswith("/бот -коины"))
 async def mod_coins(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -1425,7 +1434,6 @@ async def mod_coins(message: Message):
     await add_log(message.from_user.id, f"{'+' if is_plus else '-'}{amount} коинов для {target_name}")
     await message.reply(f"Баланс игрока <b>{target_name}</b> изменен на {'+' if is_plus else '-'}{amount} 🪙.")
 
-# Выдача/изъятие карт с выводом юзернейма
 @dp.message(F.text.startswith("/бот +карта") | F.text.startswith("/бот -карта"))
 async def mod_cards(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
@@ -1455,7 +1463,6 @@ async def mod_cards(message: Message):
     await add_log(message.from_user.id, action_desc)
     await message.reply(f"Готово: {action_desc}.")
 
-# Изменение КД с выводом юзернейма
 @dp.message(F.text.startswith("/бот кд"))
 async def mod_cd(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
