@@ -238,7 +238,7 @@ async def add_log(admin_id: int, action: str):
         )
         await db.commit()
 
-# ----------------- НАСТРОЙКА СЕТИ (MTProto Прокси + Python 3.14) -----------------
+# ----------------- НАСТРОЙКА СЕТИ (Python 3.14) -----------------
 class TermuxAiohttpSession(AiohttpSession):
     async def create_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -276,7 +276,6 @@ async def register_middleware(handler, event: Message, data: dict):
         await get_or_create_user(event.from_user)
     if event.chat:
         await register_chat(event.chat.id, event.chat.type)
-        # Обновляем таймер активности чата для Перекати-поля
         chat_last_activity[event.chat.id] = time.time()
     return await handler(event, data)
 
@@ -288,13 +287,12 @@ async def fem_command(message: Message):
     uid = message.from_user.id
     now = time.time()
 
-    # Проверка еженедельного начисления бонуса за подписку
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT channel_bonus_claimed, last_weekly_bonus FROM users WHERE user_id = ?", (uid,)) as cur:
             b_row = await cur.fetchone()
-            if b_row and b_row[0] > 0:  # Если бонус ранее активировался
+            if b_row and b_row[0] > 0:
                 last_weekly = b_row[1]
-                if now - last_weekly >= 604800:  ждет ровно 7 дней ( неделя)
+                if now - last_weekly >= 604800:
                     if await check_channel_subscription(uid):
                         await db.execute("UPDATE users SET femcoins = femcoins + 50, last_weekly_bonus = ? WHERE user_id = ?", (now, uid))
                         await db.commit()
@@ -303,7 +301,6 @@ async def fem_command(message: Message):
                         except Exception:
                             pass
                     else:
-                        # Если отписался — сбрасываем бонус
                         await db.execute("UPDATE users SET channel_bonus_claimed = 0 WHERE user_id = ?", (uid,))
                         await db.commit()
 
@@ -369,7 +366,6 @@ async def fem_command(message: Message):
         f"{'<i>(Это дубликат! Пойдет на крафт или обмен)</i>' if is_dup else '🆕 <i>Новая карта в коллекции!</i>'}"
     )
 
-    # Кнопки под картой: Ссылка на канал бонуса + кнопка спонсора
     bot_info = await bot.get_me()
     kb_buttons = [
         [InlineKeyboardButton(text="🎁 Забрать бонус", url=f"https://t.me/{bot_info.username}?start=bonus")]
@@ -383,7 +379,6 @@ async def fem_command(message: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
     await message.answer_photo(photo=f_id, caption=caption, reply_markup=kb)
 
-    # 10% шанс спавна сундука
     if random.random() < 0.10:
         await asyncio.sleep(0.8)
         chest_id = f"ch_{int(time.time() * 1000)}_{random.randint(100, 999)}"
@@ -399,7 +394,6 @@ async def fem_command(message: Message):
             reply_markup=chest_kb
         )
 
-# Обработка открытия сундука
 @dp.callback_query(F.data.startswith("claim_chest_"))
 async def open_chest_handler(callback: CallbackQuery):
     chest_id = callback.data.replace("claim_chest_", "")
@@ -428,7 +422,6 @@ async def open_chest_handler(callback: CallbackQuery):
     )
     await callback.answer(f"Поздравляем! +{reward} фемкоинов ваши!")
 
-# Команда старт с обработкой бонуса подписки
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     args = message.text.split()
@@ -465,11 +458,6 @@ async def check_sub_callback(callback: CallbackQuery):
 
     now = time.time()
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT channel_bonus_claimed FROM users WHERE user_id = ?", (uid,)) as cur:
-            row = await cur.fetchone()
-            already_claimed = row and row[0] > 0
-
-        # Начисляем 50 монет и сбрасываем КД попытки
         await db.execute("""
             UPDATE users 
             SET femcoins = femcoins + 50, last_fem_time = 0, channel_bonus_claimed = 1, last_weekly_bonus = ? 
@@ -565,7 +553,6 @@ async def browse_cards(callback: CallbackQuery):
         await callback.message.answer_photo(photo=f_id, caption=text, reply_markup=kb)
     await callback.answer()
 
-# 3. /admin или кто админ
 @dp.message(F.text.lower().in_(["/admin", "кто админ"]))
 async def who_admin(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -574,7 +561,6 @@ async def who_admin(message: Message):
     text = row[0] if row else "Администратор ещё не настроил информацию о себе."
     await message.reply(text)
 
-# 4. /craft или крафт
 @dp.message(F.text.lower().in_(["/craft", "крафт"]))
 async def craft_command(message: Message):
     uid = message.from_user.id
@@ -673,7 +659,6 @@ async def execute_craft(callback: CallbackQuery):
                 f"<b>+{lottery_coins} 🪙 фемкоинов!</b>"
             )
 
-# 5. Трейд
 trades: Dict[str, dict] = {}
 
 @dp.message(F.text.lower().startswith("трейд"))
@@ -815,7 +800,6 @@ async def trade_confirm(callback: CallbackQuery):
     del trades[trade_id]
     await callback.message.edit_text("🎉 <b>Обмен успешно завершён!</b> Игроки обменялись картами равной редкости.")
 
-# 6. Дейлик
 @dp.message(F.text.lower().in_(["дейлик", "/daily"]))
 async def daily_command(message: Message):
     uid = message.from_user.id
@@ -853,7 +837,6 @@ async def daily_command(message: Message):
         f"<i>Не пропускайте дни, чтобы увеличивать бонус!</i>"
     )
 
-# 7. Топ 10 / топ 100
 @dp.message(F.text.lower().in_(["/top", "топ"]))
 async def top_command(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
@@ -901,7 +884,6 @@ async def send_top_100(callback: CallbackQuery):
     except Exception:
         await callback.answer("Сначала откройте диалог с ботом!", show_alert=True)
 
-# 8. /shop или магазин
 @dp.message(F.text.lower().in_(["/shop", "магазин"]))
 async def shop_command(message: Message):
     bot_info = await bot.get_me()
@@ -1024,7 +1006,6 @@ async def successful_payment_handler(message: Message):
             await db.commit()
         await message.reply(f"⭐ Оплата прошла успешно! Начислено <b>+{coins_to_add} 🪙 фемкоинов</b>.")
 
-# 9. /promo
 @dp.message(Command("promo"))
 async def promo_command(message: Message, state: FSMContext):
     await message.reply("🔑 Отправьте промокод следующим сообщением:")
@@ -1075,11 +1056,11 @@ async def process_promo(message: Message, state: FSMContext):
     await state.clear()
     await message.reply(f"🎉 Промокод успешно активирован! Ваша награда: <b>{reward_msg}</b>")
 
-# 10. /kaz или казино (С выбором ставки кнопками)
+# Казино
 @dp.message(F.text.lower().in_(["/kaz", "казино"]))
 async def casino_menu(message: Message):
     uid = message.from_user.id
-    current_bet = user_casino_bets.get(uid, 20)  # Стандартная ставка 20
+    current_bet = user_casino_bets.get(uid, 20)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -1199,10 +1180,9 @@ async def casino_play(callback: CallbackQuery):
     await callback.message.reply(res)
     await callback.answer()
 
-# ----------------- ФОНОВАЯ ЗАДАЧА: ПЕРЕКАТИ-ПОЛЕ (Сундук при неактивности) -----------------
+# Перекати-поле (Сундук при неактивности)
 async def inactivity_chest_task():
-    """Каждую минуту проверяет чаты: если нет активности 15 минут, спавнит сундук"""
-    await asyncio.sleep(10)  # Задержка при старте бота
+    await asyncio.sleep(10)
     while True:
         try:
             now = time.time()
@@ -1212,9 +1192,7 @@ async def inactivity_chest_task():
 
             for (chat_id,) in chats:
                 last_act = chat_last_activity.get(chat_id, 0)
-                # Если прошло больше 15 минут (900 секунд) с последнего сообщения в чате
                 if last_act > 0 and (now - last_act >= 900):
-                    # Обнуляем активность, чтобы сундук спавнился ровно раз в 15 минут простоя
                     chat_last_activity[chat_id] = now
 
                     chest_id = f"ch_idle_{int(now)}_{random.randint(100, 999)}"
@@ -1236,10 +1214,9 @@ async def inactivity_chest_task():
         except Exception as e:
             logger.error(f"Inactivity chest error: {e}")
 
-        await asyncio.sleep(60)  # Проверка каждую минуту
+        await asyncio.sleep(60)
 
-# ----------------- АДМИНИСТРАЦИЯ -----------------
-
+# Админка
 @dp.message(Command("plus_foto"))
 async def plus_foto_cmd(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
@@ -1383,8 +1360,6 @@ async def forced_profile(message: Message):
         return await message.reply("Укажите пользователя ответом или @username!")
 
     await show_user_profile(message.chat.id, target_user)
-
-# ----------------- СУПЕР АДМИНИСТРАТОР -----------------
 
 @dp.message(Command("admins"))
 async def list_admins(message: Message):
@@ -1653,7 +1628,7 @@ async def mod_cd(message: Message):
     target_name = await get_user_display_name(target_id)
     exp = -1 if duration_hours == -1 else time.time() + duration_hours * 3600
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
+        await db.execute("""
             UPDATE users 
             SET custom_cd_hours = ?, custom_cd_expires = ?
             WHERE user_id = ?
@@ -1684,7 +1659,6 @@ async def save_adm_text(message: Message, state: FSMContext):
 # ----------------- ЗАПУСК -----------------
 async def main():
     await init_db()
-    # Запускаем фоновую задачу для сундука при неактивности чатов (Перекати-поле)
     asyncio.create_task(inactivity_chest_task())
     try:
         await bot.delete_webhook(drop_pending_updates=True)
