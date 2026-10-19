@@ -272,9 +272,6 @@ bot = Bot(
 )
 dp = Dispatcher(storage=MemoryStorage())
 
-# Универсальный нормализатор команд из групп с @юзернеймом бота
-bot_username_cached: Optional[str] = None
-
 def get_normalized_command(text: Optional[str]) -> str:
     if not text:
         return ""
@@ -301,7 +298,6 @@ async def check_channel_subscription(user_id: int) -> tuple[bool, str]:
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
         status = str(getattr(member, "status", "")).lower()
-        # Включаем все допустимые статусы подписчика
         if any(s in status for s in ["creator", "administrator", "member", "restricted"]):
             return True, "ok"
         return False, "not_member"
@@ -318,7 +314,9 @@ async def register_middleware(handler, event: Message, data: dict):
         await get_or_create_user(event.from_user)
     if event.chat:
         await register_chat(event.chat.id, event.chat.type)
-        chat_last_activity[event.chat.id] = time.time()
+        # Отслеживаем активность только в публичных/приватных группах и супергруппах (НЕ в ЛС)
+        if event.chat.type in ["group", "supergroup"]:
+            chat_last_activity[event.chat.id] = time.time()
     return await handler(event, data)
 
 # ----------------- КОМАНДЫ ИГРОКОВ -----------------
@@ -427,7 +425,8 @@ async def fem_command(message: Message):
 
     await message.answer_photo(photo=f_id, caption=caption, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
 
-    if random.random() < 0.10:
+    # Сундук спавнится с 10% шансом ТОЛЬКО в группах (не в ЛС)
+    if message.chat.type in ["group", "supergroup"] and random.random() < 0.10:
         await asyncio.sleep(0.8)
         chest_id = f"ch_{int(time.time() * 1000)}_{random.randint(100, 999)}"
         reward_coins = random.choices([15, 25, 40, 60, 90], weights=[50, 25, 15, 7, 3])[0]
@@ -511,6 +510,34 @@ async def check_sub_callback(callback: CallbackQuery):
 
     now = time.time()
     async with aiosqlite.connect(DB_NAME) as db:
+        # Проверяем, забирал ли пользователь приветственный бонус ранее
+        async with db.execute("SELECT channel_bonus_claimed, last_weekly_bonus FROM users WHERE user_id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+            claimed = row[0] if row else 0
+            last_weekly = row[1] if row else 0
+
+        # Если бонус уже активирован:
+        if claimed > 0:
+            time_until_weekly = 604800 - (now - last_weekly)
+            if time_until_weekly > 0:
+                days = int(time_until_weekly // 86400)
+                hours = int((time_until_weekly % 86400) // 3600)
+                return await callback.answer(
+                    f"ℹ️ Вы уже активировали бонус за подписку!\nСледующие +50 🪙 будут начислены через {days}д {hours}ч.",
+                    show_alert=True
+                )
+            else:
+                # Если прошло 7 дней, выдаем очередной еженедельный бонус
+                await db.execute("UPDATE users SET femcoins = femcoins + 50, last_weekly_bonus = ? WHERE user_id = ?", (now, uid))
+                await db.commit()
+                await callback.message.edit_text(
+                    "🎁 <b>Еженедельный бонус начислен!</b>\n\n"
+                    "Вам зачислено <b>+50 🪙 фемкоинов</b> за продолжение подписки на наш канал.\n"
+                    "Следующая награда через 7 дней!"
+                )
+                return await callback.answer("Еженедельные +50 фемкоинов зачислены!")
+
+        # ПЕРВОЕ ПОЛУЧЕНИЕ БОНУСА: сброс КД + 50 монет
         await db.execute("""
             UPDATE users 
             SET femcoins = femcoins + 50, last_fem_time = 0, channel_bonus_claimed = 1, last_weekly_bonus = ? 
@@ -526,7 +553,7 @@ async def check_sub_callback(callback: CallbackQuery):
     )
     await callback.answer("Бонус успешно получен!")
 
-# 2. Передача фемкоинов (передать, перевод, /pay, /transfer)
+# 2. Передача фемкоинов
 @dp.message(lambda msg: msg.text and any(get_normalized_command(msg.text) == p or msg.text.lower().strip().startswith(p) for p in ["передать", "перевод", "/pay", "/transfer", "дать"]))
 async def transfer_coins_cmd(message: Message):
     sender_id = message.from_user.id
@@ -1185,7 +1212,7 @@ async def process_promo(message: Message, state: FSMContext):
     await state.clear()
     await message.reply(f"🎉 Промокод успешно активирован! Ваша награда: <b>{reward_msg}</b>")
 
-# 11. Казино (Яркие индикаторы выбранной ставки)
+# 11. Казино
 def build_casino_kb(current_bet: int) -> InlineKeyboardMarkup:
     b10 = f"[{current_bet}🪙]" if current_bet == 10 else "10 🪙"
     b20 = f"[{current_bet}🪙]" if current_bet == 20 else "20 🪙"
@@ -1301,14 +1328,15 @@ async def casino_play(callback: CallbackQuery):
     await callback.message.reply(res)
     await callback.answer()
 
-# Перекати-поле
+# Перекати-поле (Сундук ТОЛЬКО в группах при неактивности 15 минут)
 async def inactivity_chest_task():
     await asyncio.sleep(10)
     while True:
         try:
             now = time.time()
             async with aiosqlite.connect(DB_NAME) as db:
-                async with db.execute("SELECT chat_id FROM chats") as cur:
+                # Берем только групповые чаты (исключаем private)
+                async with db.execute("SELECT chat_id FROM chats WHERE chat_type IN ('group', 'supergroup')") as cur:
                     chats = await cur.fetchall()
 
             for (chat_id,) in chats:
