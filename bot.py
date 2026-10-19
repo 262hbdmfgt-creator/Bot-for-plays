@@ -74,10 +74,10 @@ LUCK_WEIGHTS = {
 
 RARITY_ORDER = {r: i for i, r in enumerate(RARITIES)}
 
-# Хранилища активных сундуков и казино-ставок пользователей
+# Хранилища
 active_chests: Dict[str, dict] = {}
-user_casino_bets: Dict[int, int] = {}  # user_id -> текущая ставка
-chat_last_activity: Dict[int, float] = {}  # chat_id -> timestamp последнего сообщения
+user_casino_bets: Dict[int, int] = {}
+chat_last_activity: Dict[int, float] = {}
 
 # ----------------- FSM СОСТОЯНИЯ -----------------
 class AdminStates(StatesGroup):
@@ -114,6 +114,19 @@ async def init_db():
                 first_seen REAL DEFAULT 0
             )
         """)
+        # Миграция колонок на случай если таблица уже существовала
+        for col_def in [
+            "channel_bonus_claimed REAL DEFAULT 0",
+            "last_weekly_bonus REAL DEFAULT 0",
+            "first_seen REAL DEFAULT 0"
+        ]:
+            col_name = col_def.split()[0]
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_def}")
+                await db.commit()
+            except Exception:
+                pass
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
@@ -214,13 +227,15 @@ async def get_or_create_user(user: types.User):
                     )
                     await db.commit()
 
-async def get_user_display_name(user_id: int) -> str:
+async def get_user_display_name(user_id: int, clean: bool = False) -> str:
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT username FROM users WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
             if row and row[0]:
-                uname = row[0]
-                return f"@{uname}" if not uname.startswith("@") and " " not in uname else uname
+                uname = row[0].lstrip("@")
+                if clean:
+                    return uname
+                return f"@{uname}" if " " not in uname else uname
     return f"ID:{user_id}"
 
 async def is_admin(user_id: int) -> bool:
@@ -238,7 +253,7 @@ async def add_log(admin_id: int, action: str):
         )
         await db.commit()
 
-# ----------------- НАСТРОЙКА СЕТИ (Python 3.14) -----------------
+# ----------------- НАСТРОЙКА СЕТИ -----------------
 class TermuxAiohttpSession(AiohttpSession):
     async def create_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -262,7 +277,6 @@ bot = Bot(
 )
 dp = Dispatcher(storage=MemoryStorage())
 
-# Проверка подписки на канал
 async def check_channel_subscription(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
@@ -281,28 +295,29 @@ async def register_middleware(handler, event: Message, data: dict):
 
 # ----------------- ПОЛЬЗОВАТЕЛИ -----------------
 
-# 1. /foto или фем + Спавн Сундука (10% шанс) + Кнопка бонуса
-@dp.message(F.text.lower().in_(["/foto", "фем"]))
+# 1. /foto или фем (устойчивый фильтр для любого регистра и пробелов)
+def is_fem_cmd(message: Message) -> bool:
+    if not message.text:
+        return False
+    t = message.text.strip().lower()
+    return t in ["/foto", "фем", "fem", "/fem", "/foto@"+(bot._me.username.lower() if bot._me else "")]
+
+@dp.message(lambda msg: is_fem_cmd(msg))
 async def fem_command(message: Message):
     uid = message.from_user.id
     now = time.time()
 
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT channel_bonus_claimed, last_weekly_bonus FROM users WHERE user_id = ?", (uid,)) as cur:
-            b_row = await cur.fetchone()
-            if b_row and b_row[0] > 0:
-                last_weekly = b_row[1]
-                if now - last_weekly >= 604800:
-                    if await check_channel_subscription(uid):
-                        await db.execute("UPDATE users SET femcoins = femcoins + 50, last_weekly_bonus = ? WHERE user_id = ?", (now, uid))
-                        await db.commit()
-                        try:
-                            await bot.send_message(uid, "🎁 <b>Еженедельный бонус!</b>\nВам начислено <b>+50 🪙 фемкоинов</b> за подписку на ТГК!")
-                        except Exception:
-                            pass
-                    else:
-                        await db.execute("UPDATE users SET channel_bonus_claimed = 0 WHERE user_id = ?", (uid,))
-                        await db.commit()
+        # Еженедельный бонус
+        try:
+            async with db.execute("SELECT channel_bonus_claimed, last_weekly_bonus FROM users WHERE user_id = ?", (uid,)) as cur:
+                b_row = await cur.fetchone()
+                if b_row and (b_row[0] or 0) > 0:
+                    last_weekly = b_row[1] or 0
+                    if now - last_weekly >= 604800:
+                        asyncio.create_task(process_weekly_sub(uid, now))
+        except Exception as e:
+            logger.warning(f"Weekly check error: {e}")
 
         async with db.execute(
             "SELECT last_fem_time, custom_cd_hours, custom_cd_expires, has_cd_reset, cd_reset_expires, luck_expires FROM users WHERE user_id = ?",
@@ -310,7 +325,10 @@ async def fem_command(message: Message):
         ) as cur:
             row = await cur.fetchone()
 
-        last_fem, custom_cd, custom_exp, has_reset, reset_exp, luck_exp = row
+        if not row:
+            last_fem, custom_cd, custom_exp, has_reset, reset_exp, luck_exp = 0, 3.0, 0, 0, 0, 0
+        else:
+            last_fem, custom_cd, custom_exp, has_reset, reset_exp, luck_exp = row
 
         effective_cd = 3.0
         if custom_exp == -1 or custom_exp > now:
@@ -366,9 +384,9 @@ async def fem_command(message: Message):
         f"{'<i>(Это дубликат! Пойдет на крафт или обмен)</i>' if is_dup else '🆕 <i>Новая карта в коллекции!</i>'}"
     )
 
-    bot_info = await bot.get_me()
+    bot_me = await bot.get_me()
     kb_buttons = [
-        [InlineKeyboardButton(text="🎁 Забрать бонус", url=f"https://t.me/{bot_info.username}?start=bonus")]
+        [InlineKeyboardButton(text="🎁 Забрать бонус", url=f"https://t.me/{bot_me.username}?start=bonus")]
     ]
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM settings WHERE key = 'post_btn_url'") as cur:
@@ -376,9 +394,9 @@ async def fem_command(message: Message):
             if btn_row and btn_row[0]:
                 kb_buttons.append([InlineKeyboardButton(text="Присоединиться / Подробнее", url=btn_row[0])])
 
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
-    await message.answer_photo(photo=f_id, caption=caption, reply_markup=kb)
+    await message.answer_photo(photo=f_id, caption=caption, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
 
+    # 10% шанс спавна сундука
     if random.random() < 0.10:
         await asyncio.sleep(0.8)
         chest_id = f"ch_{int(time.time() * 1000)}_{random.randint(100, 999)}"
@@ -394,6 +412,20 @@ async def fem_command(message: Message):
             reply_markup=chest_kb
         )
 
+async def process_weekly_sub(uid: int, now: float):
+    if await check_channel_subscription(uid):
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("UPDATE users SET femcoins = femcoins + 50, last_weekly_bonus = ? WHERE user_id = ?", (now, uid))
+            await db.commit()
+        try:
+            await bot.send_message(uid, "🎁 <b>Еженедельный бонус!</b>\nВам начислено <b>+50 🪙 фемкоинов</b> за подписку на ТГК!")
+        except Exception:
+            pass
+    else:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("UPDATE users SET channel_bonus_claimed = 0 WHERE user_id = ?", (uid,))
+            await db.commit()
+
 @dp.callback_query(F.data.startswith("claim_chest_"))
 async def open_chest_handler(callback: CallbackQuery):
     chest_id = callback.data.replace("claim_chest_", "")
@@ -407,7 +439,7 @@ async def open_chest_handler(callback: CallbackQuery):
 
     chest["claimed"] = True
     uid = callback.from_user.id
-    u_name = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.full_name
+    u_name = callback.from_user.username or callback.from_user.full_name
     chest["winner_name"] = u_name
     reward = chest["coins"]
 
@@ -427,8 +459,8 @@ async def start_cmd(message: Message):
     args = message.text.split()
     if len(args) > 1 and args[1] == "bonus":
         if message.chat.type != "private":
-            bot_info = await bot.get_me()
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Получить бонус в ЛС", url=f"https://t.me/{bot_info.username}?start=bonus")]])
+            bot_me = await bot.get_me()
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Получить бонус в ЛС", url=f"https://t.me/{bot_me.username}?start=bonus")]])
             return await message.reply("🎁 Бонус выдается в личных сообщениях с ботом!", reply_markup=kb)
 
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -473,8 +505,79 @@ async def check_sub_callback(callback: CallbackQuery):
     )
     await callback.answer("Бонус успешно получен!")
 
-# 2. /profil или профиль
-@dp.message(F.text.lower().in_(["/profil", "профиль"]))
+# 2. Передача фемкоинов с комиссией (передать / перевести / /pay / /transfer)
+@dp.message(lambda msg: msg.text and any(msg.text.lower().strip().startswith(prefix) for prefix in ["передать", "перевод", "/pay", "/transfer", "дать"]))
+async def transfer_coins_cmd(message: Message):
+    sender_id = message.from_user.id
+    parts = message.text.strip().split()
+
+    amount: Optional[int] = None
+    target_id: Optional[int] = None
+
+    # Поиск суммы среди аргументов
+    for p in parts[1:]:
+        if p.isdigit():
+            amount = int(p)
+            break
+
+    if not amount or amount <= 0:
+        return await message.reply("❗ Укажите корректную сумму для передачи!\nПример: <code>передать 100</code> (ответом на сообщение) или <code>передать @username 100</code>")
+
+    # Определение получателя: ответ на сообщение либо через @username
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    else:
+        for p in parts[1:]:
+            if p.startswith("@"):
+                uname = p.lstrip("@")
+                async with aiosqlite.connect(DB_NAME) as db:
+                    async with db.execute("SELECT user_id FROM users WHERE username = ? OR username = ?", (uname, f"@{uname}")) as cur:
+                        row = await cur.fetchone()
+                        if row:
+                            target_id = row[0]
+                break
+
+    if not target_id:
+        return await message.reply("❗ Укажите получателя ответом на его сообщение или тегом @username!")
+
+    if target_id == sender_id:
+        return await message.reply("❌ Нельзя переводить фемкоины самому себе!")
+
+    COMMISSION_PERCENT = 10  # 10% комиссия (сгорает при переводе)
+    burned = max(1, int(amount * COMMISSION_PERCENT / 100))
+    received = amount - burned
+
+    if received <= 0:
+        return await message.reply(f"❌ Сумма слишком мала для передачи с учетом комиссии {COMMISSION_PERCENT}%!")
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT femcoins FROM users WHERE user_id = ?", (sender_id,)) as cur:
+            s_row = await cur.fetchone()
+            sender_coins = s_row[0] if s_row else 0
+
+        if sender_coins < amount:
+            return await message.reply(f"❌ Недостаточно фемкоинов! Ваш баланс: {sender_coins} 🪙, а требуется: {amount} 🪙.")
+
+        # Списываем у отправителя
+        await db.execute("UPDATE users SET femcoins = femcoins - ? WHERE user_id = ?", (amount, sender_id))
+        # Начисляем получателю (за вычетом комиссии)
+        await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (received, target_id))
+        await db.commit()
+
+    sender_name = await get_user_display_name(sender_id, clean=True)
+    target_name = await get_user_display_name(target_id, clean=True)
+
+    await message.reply(
+        f"💸 <b>Успешный перевод фемкоинов!</b>\n\n"
+        f"👤 Отправитель: <b>{sender_name}</b>\n"
+        f"🎯 Получатель: <b>{target_name}</b>\n"
+        f"💰 Отправлено: <b>{amount} 🪙</b>\n"
+        f"📥 Получено: <b>+{received} 🪙</b>\n"
+        f"🔥 Комиссия (сгорело): <b>{burned} 🪙</b> ({COMMISSION_PERCENT}%)"
+    )
+
+# 3. /profil или профиль
+@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/profil", "профиль", "/profile"])
 async def profile_command(message: Message):
     await show_user_profile(message.chat.id, message.from_user, reply_to=message.message_id)
 
@@ -491,7 +594,7 @@ async def show_user_profile(chat_id: int, user: types.User, reply_to: int = None
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🖼 Смотреть все фото", callback_data=f"viewcards_{user.id}_0")]
     ])
-    u_display = f"@{user.username}" if user.username else user.full_name
+    u_display = user.username or user.full_name
     caption = (
         f"👤 <b>Профиль игрока:</b> {u_display}\n"
         f"💰 <b>Фемкоины:</b> {coins} 🪙\n"
@@ -553,7 +656,8 @@ async def browse_cards(callback: CallbackQuery):
         await callback.message.answer_photo(photo=f_id, caption=text, reply_markup=kb)
     await callback.answer()
 
-@dp.message(F.text.lower().in_(["/admin", "кто админ"]))
+# 4. /admin или кто админ
+@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/admin", "кто админ"])
 async def who_admin(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM settings WHERE key = 'admin_info'") as cur:
@@ -561,7 +665,8 @@ async def who_admin(message: Message):
     text = row[0] if row else "Администратор ещё не настроил информацию о себе."
     await message.reply(text)
 
-@dp.message(F.text.lower().in_(["/craft", "крафт"]))
+# 5. /craft или крафт
+@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/craft", "крафт"])
 async def craft_command(message: Message):
     uid = message.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
@@ -659,9 +764,10 @@ async def execute_craft(callback: CallbackQuery):
                 f"<b>+{lottery_coins} 🪙 фемкоинов!</b>"
             )
 
+# 6. Трейд
 trades: Dict[str, dict] = {}
 
-@dp.message(F.text.lower().startswith("трейд"))
+@dp.message(lambda msg: msg.text and msg.text.lower().strip().startswith("трейд"))
 async def trade_init(message: Message):
     if not message.reply_to_message or not message.reply_to_message.from_user:
         return await message.reply("❗ Команда должна быть ответом на сообщение игрока, с которым вы хотите обменяться!")
@@ -672,8 +778,8 @@ async def trade_init(message: Message):
     if receiver.id == sender.id or receiver.is_bot:
         return await message.reply("❌ Нельзя торговать с самим собой или ботами!")
 
-    p1_name = f"@{sender.username}" if sender.username else sender.full_name
-    p2_name = f"@{receiver.username}" if receiver.username else receiver.full_name
+    p1_name = sender.username or sender.full_name
+    p2_name = receiver.username or receiver.full_name
 
     trade_id = f"tr_{sender.id}_{receiver.id}_{int(time.time())}"
     trades[trade_id] = {
@@ -800,14 +906,16 @@ async def trade_confirm(callback: CallbackQuery):
     del trades[trade_id]
     await callback.message.edit_text("🎉 <b>Обмен успешно завершён!</b> Игроки обменялись картами равной редкости.")
 
-@dp.message(F.text.lower().in_(["дейлик", "/daily"]))
+# 7. Дейлик
+@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["дейлик", "/daily"])
 async def daily_command(message: Message):
     uid = message.from_user.id
     now = time.time()
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT daily_streak, last_daily_time FROM users WHERE user_id = ?", (uid,)) as cur:
-            streak, last_time = await cur.fetchone()
+            row = await cur.fetchone()
+            streak, last_time = row[0] or 0, row[1] or 0
 
         diff = now - last_time
         if diff < 86400:
@@ -837,7 +945,8 @@ async def daily_command(message: Message):
         f"<i>Не пропускайте дни, чтобы увеличивать бонус!</i>"
     )
 
-@dp.message(F.text.lower().in_(["/top", "топ"]))
+# 8. Топ 10 / топ 100 БЕЗ @ (чистые ники, не тегают)
+@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/top", "топ"])
 async def top_command(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("""
@@ -852,8 +961,8 @@ async def top_command(message: Message):
 
     text = "🏆 <b>ТОП 10 КОЛЛЕКЦИОНЕРОВ</b>\n\n"
     for i, (uname, total, _) in enumerate(rows, 1):
-        u_disp = f"@{uname}" if uname and not uname.startswith("@") and " " not in uname else (uname or "Аноним")
-        text += f"{i}. <b>{u_disp}</b> — {total} карт\n"
+        clean_name = (uname or "Аноним").lstrip("@")
+        text += f"{i}. <b>{clean_name}</b> — {total} карт\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📜 Показать ТОП 100 в ЛС", callback_data="top_100_dm")]
@@ -875,8 +984,8 @@ async def send_top_100(callback: CallbackQuery):
 
     text = "📜 <b>ТОП 100 ИГРОКОВ:</b>\n\n"
     for i, (uname, total, _) in enumerate(rows, 1):
-        u_disp = f"@{uname}" if uname and not uname.startswith("@") and " " not in uname else (uname or "Аноним")
-        text += f"{i}. {u_disp} — {total} шт.\n"
+        clean_name = (uname or "Аноним").lstrip("@")
+        text += f"{i}. {clean_name} — {total} шт.\n"
 
     try:
         await bot.send_message(callback.from_user.id, text)
@@ -884,18 +993,20 @@ async def send_top_100(callback: CallbackQuery):
     except Exception:
         await callback.answer("Сначала откройте диалог с ботом!", show_alert=True)
 
-@dp.message(F.text.lower().in_(["/shop", "магазин"]))
+# 9. /shop или магазин
+@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/shop", "магазин"])
 async def shop_command(message: Message):
-    bot_info = await bot.get_me()
+    bot_me = await bot.get_me()
     if message.chat.type != "private":
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🏪 Перейти в магазин", url=f"https://t.me/{bot_info.username}?start=shop")]
+            [InlineKeyboardButton(text="🏪 Перейти в магазин", url=f"https://t.me/{bot_me.username}?start=shop")]
         ])
         return await message.reply("🏪 Магазин доступен только в личных сообщениях с ботом!", reply_markup=kb)
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT femcoins FROM users WHERE user_id = ?", (message.from_user.id,)) as cur:
-            coins = (await cur.fetchone())[0]
+            row = await cur.fetchone()
+            coins = row[0] if row else 0
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Сброс КД (150 🪙)", callback_data="buy_cd_reset")],
@@ -1006,6 +1117,7 @@ async def successful_payment_handler(message: Message):
             await db.commit()
         await message.reply(f"⭐ Оплата прошла успешно! Начислено <b>+{coins_to_add} 🪙 фемкоинов</b>.")
 
+# 10. /promo
 @dp.message(Command("promo"))
 async def promo_command(message: Message, state: FSMContext):
     await message.reply("🔑 Отправьте промокод следующим сообщением:")
@@ -1056,8 +1168,8 @@ async def process_promo(message: Message, state: FSMContext):
     await state.clear()
     await message.reply(f"🎉 Промокод успешно активирован! Ваша награда: <b>{reward_msg}</b>")
 
-# Казино
-@dp.message(F.text.lower().in_(["/kaz", "казино"]))
+# 11. Казино
+@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/kaz", "казино"])
 async def casino_menu(message: Message):
     uid = message.from_user.id
     current_bet = user_casino_bets.get(uid, 20)
@@ -1117,7 +1229,7 @@ async def set_casino_bet(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("kaz_"))
 async def casino_play(callback: CallbackQuery):
     uid = callback.from_user.id
-    u_name = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.full_name
+    u_name = callback.from_user.username or callback.from_user.full_name
     act = callback.data
     bet = user_casino_bets.get(uid, 20)
 
@@ -1250,17 +1362,17 @@ async def process_admin_desc(message: Message, state: FSMContext):
         card_id = cur.lastrowid
         await db.commit()
 
-    admin_display = await get_user_display_name(message.from_user.id)
+    admin_display = await get_user_display_name(message.from_user.id, clean=True)
     await add_log(message.from_user.id, f"{admin_display} добавил карту #{card_id} [{rarity}]")
     await state.clear()
     await message.reply(f"✅ Карта #{card_id} успешно создана и добавлена в базу!")
 
-@dp.message(F.text.lower().in_(["all card", "100 card"]))
+@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["all card", "100 card"])
 async def view_cards_album(message: Message):
     if not await is_admin(message.from_user.id):
         return
 
-    limit = 100 if message.text.lower() == "100 card" else 500
+    limit = 100 if message.text.lower().strip() == "100 card" else 500
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT id, file_id, rarity FROM cards ORDER BY id DESC LIMIT ?", (limit,)) as cur:
             cards = await cur.fetchall()
@@ -1318,7 +1430,7 @@ async def edit_card_rarity(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("saverar_"))
 async def save_card_rarity(callback: CallbackQuery):
     _, c_id, r = callback.data.split("_")
-    admin_display = await get_user_display_name(callback.from_user.id)
+    admin_display = await get_user_display_name(callback.from_user.id, clean=True)
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("UPDATE cards SET rarity = ? WHERE id = ?", (r, int(c_id)))
         await db.commit()
@@ -1328,7 +1440,7 @@ async def save_card_rarity(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("delcard_"))
 async def delete_card(callback: CallbackQuery):
     c_id = int(callback.data.split("_")[1])
-    admin_display = await get_user_display_name(callback.from_user.id)
+    admin_display = await get_user_display_name(callback.from_user.id, clean=True)
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM cards WHERE id = ?", (c_id,))
         await db.execute("DELETE FROM inventory WHERE card_id = ?", (c_id,))
@@ -1338,7 +1450,7 @@ async def delete_card(callback: CallbackQuery):
     await add_log(callback.from_user.id, f"{admin_display} удалил карту #{c_id} со сдвигом ID")
     await callback.message.edit_text(f"🗑 Карта #{c_id} удалена, номера последующих карт сдвинуты на -1.")
 
-@dp.message(F.text.lower().startswith("твой профиль"))
+@dp.message(lambda msg: msg.text and msg.text.lower().strip().startswith("твой профиль"))
 async def forced_profile(message: Message):
     if not await is_admin(message.from_user.id):
         return
@@ -1349,7 +1461,7 @@ async def forced_profile(message: Message):
     else:
         parts = message.text.split()
         if len(parts) > 2:
-            uname = parts[2].replace("@", "")
+            uname = parts[2].lstrip("@")
             async with aiosqlite.connect(DB_NAME) as db:
                 async with db.execute("SELECT user_id FROM users WHERE username = ? OR username = ?", (uname, f"@{uname}")) as cur:
                     row = await cur.fetchone()
@@ -1375,7 +1487,7 @@ async def list_admins(message: Message):
 
     buttons = []
     for (uid,) in rows:
-        disp_name = await get_user_display_name(uid)
+        disp_name = await get_user_display_name(uid, clean=True)
         buttons.append([InlineKeyboardButton(text=f"❌ Снять {disp_name}", callback_data=f"removeadm_{uid}")])
 
     await message.reply("Список действующих администраторов:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
@@ -1385,7 +1497,7 @@ async def remove_adm_cb(callback: CallbackQuery):
     if callback.from_user.id != SUPER_ADMIN_ID:
         return
     uid = int(callback.data.replace("removeadm_", ""))
-    disp_name = await get_user_display_name(uid)
+    disp_name = await get_user_display_name(uid, clean=True)
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("DELETE FROM admins WHERE user_id = ?", (uid,))
         await db.commit()
@@ -1469,11 +1581,11 @@ async def check_admin_code(message: Message, state: FSMContext):
         await db.commit()
 
     await state.clear()
-    disp_name = await get_user_display_name(message.from_user.id)
+    disp_name = await get_user_display_name(message.from_user.id, clean=True)
     await add_log(message.from_user.id, f"{disp_name} стал администратором через инвайт-код")
     await message.reply("🎉 Поздравляем! Вы получили права администратора бота.")
 
-@dp.message(F.text.startswith("/create_p"))
+@dp.message(lambda msg: msg.text and msg.text.startswith("/create_p"))
 async def create_promo_cmd(message: Message, state: FSMContext):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1545,7 +1657,7 @@ async def view_logs(message: Message):
     text = "📋 <b>Последние 25 действий администрации:</b>\n\n"
     for a_id, act, ts in rows:
         dt = datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
-        adm_name = await get_user_display_name(a_id)
+        adm_name = await get_user_display_name(a_id, clean=True)
         text += f"[{dt}] <b>{adm_name}:</b> {act}\n"
 
     await message.reply(text)
@@ -1555,14 +1667,14 @@ async def resolve_target(message: Message, arg_index: int = -1) -> Optional[int]
         return message.reply_to_message.from_user.id
     parts = message.text.split()
     if len(parts) > arg_index and parts[arg_index].startswith("@"):
-        uname = parts[arg_index].replace("@", "")
+        uname = parts[arg_index].lstrip("@")
         async with aiosqlite.connect(DB_NAME) as db:
             async with db.execute("SELECT user_id FROM users WHERE username = ? OR username = ?", (uname, f"@{uname}")) as cur:
                 row = await cur.fetchone()
                 return row[0] if row else None
     return None
 
-@dp.message(F.text.startswith("/бот +коины") | F.text.startswith("/бот -коины"))
+@dp.message(lambda msg: msg.text and (msg.text.startswith("/бот +коины") or msg.text.startswith("/бот -коины")))
 async def mod_coins(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1572,7 +1684,7 @@ async def mod_coins(message: Message):
     if not target_id:
         return await message.reply("Укажите пользователя тегом или реплаем!")
 
-    target_name = await get_user_display_name(target_id)
+    target_name = await get_user_display_name(target_id, clean=True)
     is_plus = "+коины" in parts[1]
     async with aiosqlite.connect(DB_NAME) as db:
         if is_plus:
@@ -1584,7 +1696,7 @@ async def mod_coins(message: Message):
     await add_log(message.from_user.id, f"{'+' if is_plus else '-'}{amount} коинов для {target_name}")
     await message.reply(f"Баланс игрока <b>{target_name}</b> изменен на {'+' if is_plus else '-'}{amount} 🪙.")
 
-@dp.message(F.text.startswith("/бот +карта") | F.text.startswith("/бот -карта"))
+@dp.message(lambda msg: msg.text and (msg.text.startswith("/бот +карта") or msg.text.startswith("/бот -карта")))
 async def mod_cards(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1594,7 +1706,7 @@ async def mod_cards(message: Message):
     if not target_id:
         return await message.reply("Укажите пользователя тегом или реплаем!")
 
-    target_name = await get_user_display_name(target_id)
+    target_name = await get_user_display_name(target_id, clean=True)
     is_plus = "+карта" in parts[1]
     async with aiosqlite.connect(DB_NAME) as db:
         if is_plus:
@@ -1613,7 +1725,7 @@ async def mod_cards(message: Message):
     await add_log(message.from_user.id, action_desc)
     await message.reply(f"Готово: {action_desc}.")
 
-@dp.message(F.text.startswith("/бот кд"))
+@dp.message(lambda msg: msg.text and msg.text.startswith("/бот кд"))
 async def mod_cd(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1625,7 +1737,7 @@ async def mod_cd(message: Message):
     if not target_id:
         return await message.reply("Укажите пользователя тегом или ответом!")
 
-    target_name = await get_user_display_name(target_id)
+    target_name = await get_user_display_name(target_id, clean=True)
     exp = -1 if duration_hours == -1 else time.time() + duration_hours * 3600
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute("""
@@ -1652,7 +1764,7 @@ async def save_adm_text(message: Message, state: FSMContext):
         await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_info', ?)", (text,))
         await db.commit()
     await state.clear()
-    admin_name = await get_user_display_name(message.from_user.id)
+    admin_name = await get_user_display_name(message.from_user.id, clean=True)
     await add_log(message.from_user.id, f"{admin_name} обновил текст 'кто админ'")
     await message.reply("✅ Текст администратора успешно сохранен!")
 
