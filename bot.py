@@ -37,6 +37,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0").strip() or "0")
 DB_NAME = "fem_bot.db"
 
+# Настройки канала для бонуса
+CHANNEL_USERNAME = "@FM_femboy"
+CHANNEL_URL = "https://t.me/FM_femboy"
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -70,8 +74,10 @@ LUCK_WEIGHTS = {
 
 RARITY_ORDER = {r: i for i, r in enumerate(RARITIES)}
 
-# Хранилище активных интерактивных сундуков
+# Хранилища активных сундуков и казино-ставок пользователей
 active_chests: Dict[str, dict] = {}
+user_casino_bets: Dict[int, int] = {}  # user_id -> текущая ставка
+chat_last_activity: Dict[int, float] = {}  # chat_id -> timestamp последнего сообщения
 
 # ----------------- FSM СОСТОЯНИЯ -----------------
 class AdminStates(StatesGroup):
@@ -103,6 +109,8 @@ async def init_db():
                 luck_expires REAL DEFAULT 0,
                 daily_streak INTEGER DEFAULT 0,
                 last_daily_time REAL DEFAULT 0,
+                channel_bonus_claimed REAL DEFAULT 0,
+                last_weekly_bonus REAL DEFAULT 0,
                 first_seen REAL DEFAULT 0
             )
         """)
@@ -230,12 +238,8 @@ async def add_log(admin_id: int, action: str):
         )
         await db.commit()
 
-# ----------------- НАСТРОЙКА СЕТИ (СОВМЕСТИМО С PYTHON 3.14) -----------------
+# ----------------- НАСТРОЙКА СЕТИ (MTProto Прокси + Python 3.14) -----------------
 class TermuxAiohttpSession(AiohttpSession):
-    """
-    Кастомная сессия: коннектор создается ТОЛЬКО внутри запущенного event loop,
-    что полностью исключает ошибку RuntimeError: no running event loop в Python 3.14
-    """
     async def create_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
@@ -258,23 +262,51 @@ bot = Bot(
 )
 dp = Dispatcher(storage=MemoryStorage())
 
+# Проверка подписки на канал
+async def check_channel_subscription(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status in ["creator", "administrator", "member"]
+    except Exception:
+        return False
+
 @dp.message.outer_middleware()
 async def register_middleware(handler, event: Message, data: dict):
     if event.from_user:
         await get_or_create_user(event.from_user)
     if event.chat:
         await register_chat(event.chat.id, event.chat.type)
+        # Обновляем таймер активности чата для Перекати-поля
+        chat_last_activity[event.chat.id] = time.time()
     return await handler(event, data)
 
 # ----------------- ПОЛЬЗОВАТЕЛИ -----------------
 
-# 1. /foto или фем + Спавн Сундука (10% шанс)
+# 1. /foto или фем + Спавн Сундука (10% шанс) + Кнопка бонуса
 @dp.message(F.text.lower().in_(["/foto", "фем"]))
 async def fem_command(message: Message):
     uid = message.from_user.id
     now = time.time()
 
+    # Проверка еженедельного начисления бонуса за подписку
     async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT channel_bonus_claimed, last_weekly_bonus FROM users WHERE user_id = ?", (uid,)) as cur:
+            b_row = await cur.fetchone()
+            if b_row and b_row[0] > 0:  # Если бонус ранее активировался
+                last_weekly = b_row[1]
+                if now - last_weekly >= 604800:  ждет ровно 7 дней ( неделя)
+                    if await check_channel_subscription(uid):
+                        await db.execute("UPDATE users SET femcoins = femcoins + 50, last_weekly_bonus = ? WHERE user_id = ?", (now, uid))
+                        await db.commit()
+                        try:
+                            await bot.send_message(uid, "🎁 <b>Еженедельный бонус!</b>\nВам начислено <b>+50 🪙 фемкоинов</b> за подписку на ТГК!")
+                        except Exception:
+                            pass
+                    else:
+                        # Если отписался — сбрасываем бонус
+                        await db.execute("UPDATE users SET channel_bonus_claimed = 0 WHERE user_id = ?", (uid,))
+                        await db.commit()
+
         async with db.execute(
             "SELECT last_fem_time, custom_cd_hours, custom_cd_expires, has_cd_reset, cd_reset_expires, luck_expires FROM users WHERE user_id = ?",
             (uid,)
@@ -337,25 +369,26 @@ async def fem_command(message: Message):
         f"{'<i>(Это дубликат! Пойдет на крафт или обмен)</i>' if is_dup else '🆕 <i>Новая карта в коллекции!</i>'}"
     )
 
-    kb = None
+    # Кнопки под картой: Ссылка на канал бонуса + кнопка спонсора
+    bot_info = await bot.get_me()
+    kb_buttons = [
+        [InlineKeyboardButton(text="🎁 Забрать бонус", url=f"https://t.me/{bot_info.username}?start=bonus")]
+    ]
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM settings WHERE key = 'post_btn_url'") as cur:
             btn_row = await cur.fetchone()
             if btn_row and btn_row[0]:
-                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Присоединиться / Подробнее", url=btn_row[0])]])
+                kb_buttons.append([InlineKeyboardButton(text="Присоединиться / Подробнее", url=btn_row[0])])
 
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
     await message.answer_photo(photo=f_id, caption=caption, reply_markup=kb)
 
-    # 10% шанс спавна сундука с фемкоинами
+    # 10% шанс спавна сундука
     if random.random() < 0.10:
         await asyncio.sleep(0.8)
         chest_id = f"ch_{int(time.time() * 1000)}_{random.randint(100, 999)}"
         reward_coins = random.choices([15, 25, 40, 60, 90], weights=[50, 25, 15, 7, 3])[0]
-        active_chests[chest_id] = {
-            "coins": reward_coins,
-            "claimed": False,
-            "winner_name": None,
-        }
+        active_chests[chest_id] = {"coins": reward_coins, "claimed": False, "winner_name": None}
 
         chest_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🎁 Забрать сундук!", callback_data=f"claim_chest_{chest_id}")]
@@ -394,6 +427,63 @@ async def open_chest_handler(callback: CallbackQuery):
         f"💰 Награда: <b>+{reward} 🪙 фемкоинов</b> зачислена на баланс!"
     )
     await callback.answer(f"Поздравляем! +{reward} фемкоинов ваши!")
+
+# Команда старт с обработкой бонуса подписки
+@dp.message(CommandStart())
+async def start_cmd(message: Message):
+    args = message.text.split()
+    if len(args) > 1 and args[1] == "bonus":
+        if message.chat.type != "private":
+            bot_info = await bot.get_me()
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Получить бонус в ЛС", url=f"https://t.me/{bot_info.username}?start=bonus")]])
+            return await message.reply("🎁 Бонус выдается в личных сообщениях с ботом!", reply_markup=kb)
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🩷 ТГК Фембойчик", url=CHANNEL_URL)],
+            [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_channel_sub")]
+        ])
+        return await message.answer(
+            "🎁 <b>Еженедельный бонус и скип КД!</b>\n\n"
+            "Подпишитесь на наш Telegram-канал, чтобы получить:\n"
+            "• Мгновенный сброс кулдауна попыток!\n"
+            "• <b>+50 🪙 фемкоинов</b> сразу и каждую неделю пока вы подписаны!",
+            reply_markup=kb
+        )
+
+    if len(args) > 1 and args[1] == "shop":
+        return await shop_command(message)
+
+    await message.reply("👋 Привет! Я игровой бот. Напиши <b>фем</b> или /foto, чтобы начать.")
+
+@dp.callback_query(F.data == "check_channel_sub")
+async def check_sub_callback(callback: CallbackQuery):
+    uid = callback.from_user.id
+    is_sub = await check_channel_subscription(uid)
+
+    if not is_sub:
+        return await callback.answer("❌ Вы не подписаны на канал! Сначала подпишитесь.", show_alert=True)
+
+    now = time.time()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT channel_bonus_claimed FROM users WHERE user_id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+            already_claimed = row and row[0] > 0
+
+        # Начисляем 50 монет и сбрасываем КД попытки
+        await db.execute("""
+            UPDATE users 
+            SET femcoins = femcoins + 50, last_fem_time = 0, channel_bonus_claimed = 1, last_weekly_bonus = ? 
+            WHERE user_id = ?
+        """, (now, uid))
+        await db.commit()
+
+    await callback.message.edit_text(
+        "✅ <b>Подписка подтверждена!</b>\n\n"
+        "🔄 Кулдаун команды <code>фем</code> полностью сброшен!\n"
+        "💰 Начислено: <b>+50 🪙 фемкоинов</b>.\n\n"
+        "⭐ <i>Внимание: 50 фемкоинов будут автоматически начисляться вам каждую неделю, пока вы подписаны на канал!</i>"
+    )
+    await callback.answer("Бонус успешно получен!")
 
 # 2. /profil или профиль
 @dp.message(F.text.lower().in_(["/profil", "профиль"]))
@@ -843,12 +933,6 @@ async def shop_command(message: Message):
         reply_markup=kb,
     )
 
-@dp.message(CommandStart())
-async def start_cmd(message: Message):
-    if len(message.text.split()) > 1 and message.text.split()[1] == "shop":
-        return await shop_command(message)
-    await message.reply("👋 Привет! Я игровой бот. Напиши <b>фем</b> или /foto, чтобы начать.")
-
 @dp.callback_query(F.data == "buy_cd_reset")
 async def buy_cd(callback: CallbackQuery):
     uid = callback.from_user.id
@@ -991,77 +1075,168 @@ async def process_promo(message: Message, state: FSMContext):
     await state.clear()
     await message.reply(f"🎉 Промокод успешно активирован! Ваша награда: <b>{reward_msg}</b>")
 
-# 10. /kaz или казино
+# 10. /kaz или казино (С выбором ставки кнопками)
 @dp.message(F.text.lower().in_(["/kaz", "казино"]))
 async def casino_menu(message: Message):
+    uid = message.from_user.id
+    current_bet = user_casino_bets.get(uid, 20)  # Стандартная ставка 20
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎲 Бросить кости (Ставка 20 🪙)", callback_data="kaz_dice_20")],
-        [InlineKeyboardButton(text="🔴 Красное (x2, 50 🪙)", callback_data="kaz_roul_red"), InlineKeyboardButton(text="⚫ Черное (x2, 50 🪙)", callback_data="kaz_roul_black")],
-        [InlineKeyboardButton(text="🟢 Зеро (x14, 50 🪙)", callback_data="kaz_roul_zero")],
-        [InlineKeyboardButton(text="🎰 Слоты 777 (Ставка 30 🪙)", callback_data="kaz_slots_30")]
+        [
+            InlineKeyboardButton(text="10 🪙" + (" ✅" if current_bet==10 else ""), callback_data="setbet_10"),
+            InlineKeyboardButton(text="20 🪙" + (" ✅" if current_bet==20 else ""), callback_data="setbet_20"),
+            InlineKeyboardButton(text="50 🪙" + (" ✅" if current_bet==50 else ""), callback_data="setbet_50"),
+            InlineKeyboardButton(text="100 🪙" + (" ✅" if current_bet==100 else ""), callback_data="setbet_100")
+        ],
+        [InlineKeyboardButton(text=f"🎲 Бросить кости (Ставка: {current_bet} 🪙)", callback_data="kaz_dice")],
+        [
+            InlineKeyboardButton(text=f"🔴 Красное (x2, {current_bet})", callback_data="kaz_roul_red"),
+            InlineKeyboardButton(text=f"⚫ Черное (x2, {current_bet})", callback_data="kaz_roul_black")
+        ],
+        [InlineKeyboardButton(text=f"🟢 Зеро (x14, {current_bet})", callback_data="kaz_roul_zero")],
+        [InlineKeyboardButton(text=f"🎰 Слоты 777 (Ставка: {current_bet} 🪙)", callback_data="kaz_slots")]
     ])
-    await message.reply("🎰 <b>Добро пожаловать в Фем-Казино!</b>\nИспытайте свою удачу в играх ниже:", reply_markup=kb)
+    await message.reply(
+        f"🎰 <b>Добро пожаловать в Фем-Казино!</b>\n"
+        f"Текущая ставка: <b>{current_bet} 🪙</b> (выберите ниже):\n"
+        f"<i>Для Зеро и Рулетки минимальная ставка 20 коинов.</i>",
+        reply_markup=kb
+    )
+
+@dp.callback_query(F.data.startswith("setbet_"))
+async def set_casino_bet(callback: CallbackQuery):
+    bet_val = int(callback.data.replace("setbet_", ""))
+    uid = callback.from_user.id
+    user_casino_bets[uid] = bet_val
+
+    current_bet = bet_val
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="10 🪙" + (" ✅" if current_bet==10 else ""), callback_data="setbet_10"),
+            InlineKeyboardButton(text="20 🪙" + (" ✅" if current_bet==20 else ""), callback_data="setbet_20"),
+            InlineKeyboardButton(text="50 🪙" + (" ✅" if current_bet==50 else ""), callback_data="setbet_50"),
+            InlineKeyboardButton(text="100 🪙" + (" ✅" if current_bet==100 else ""), callback_data="setbet_100")
+        ],
+        [InlineKeyboardButton(text=f"🎲 Бросить кости (Ставка: {current_bet} 🪙)", callback_data="kaz_dice")],
+        [
+            InlineKeyboardButton(text=f"🔴 Красное (x2, {current_bet})", callback_data="kaz_roul_red"),
+            InlineKeyboardButton(text=f"⚫ Черное (x2, {current_bet})", callback_data="kaz_roul_black")
+        ],
+        [InlineKeyboardButton(text=f"🟢 Зеро (x14, {current_bet})", callback_data="kaz_roul_zero")],
+        [InlineKeyboardButton(text=f"🎰 Слоты 777 (Ставка: {current_bet} 🪙)", callback_data="kaz_slots")]
+    ])
+    await callback.message.edit_text(
+        f"🎰 <b>Добро пожаловать в Фем-Казино!</b>\n"
+        f"Текущая ставка изменена на: <b>{current_bet} 🪙</b>\n"
+        f"<i>Выберите игру ниже:</i>",
+        reply_markup=kb
+    )
+    await callback.answer(f"Ставка установлена: {current_bet} 🪙")
 
 @dp.callback_query(F.data.startswith("kaz_"))
 async def casino_play(callback: CallbackQuery):
     uid = callback.from_user.id
     u_name = f"@{callback.from_user.username}" if callback.from_user.username else callback.from_user.full_name
     act = callback.data
+    bet = user_casino_bets.get(uid, 20)
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT femcoins FROM users WHERE user_id = ?", (uid,)) as cur:
             coins = (await cur.fetchone())[0]
 
-        if act == "kaz_dice_20":
-            if coins < 20:
-                return await callback.answer("Не хватает фемкоинов!", show_alert=True)
+        if act == "kaz_dice":
+            if coins < bet:
+                return await callback.answer(f"Не хватает фемкоинов (нужно {bet})!", show_alert=True)
             u_roll = random.randint(1, 6)
             b_roll = random.randint(1, 6)
             if u_roll > b_roll:
-                await db.execute("UPDATE users SET femcoins = femcoins + 20 WHERE user_id = ?", (uid,))
-                res = f"🎲 Игрок <b>{u_name}</b> выиграл! ({u_roll} против {b_roll} у бота). Награда: +20 🪙"
+                await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (bet, uid))
+                res = f"🎲 Игрок <b>{u_name}</b> выиграл! ({u_roll} против {b_roll} у бота). Награда: +{bet} 🪙"
             elif u_roll < b_roll:
-                await db.execute("UPDATE users SET femcoins = femcoins - 20 WHERE user_id = ?", (uid,))
-                res = f"🎲 Игрок <b>{u_name}</b> проиграл! ({u_roll} против {b_roll} у бота). -20 🪙"
+                await db.execute("UPDATE users SET femcoins = femcoins - ? WHERE user_id = ?", (bet, uid))
+                res = f"🎲 Игрок <b>{u_name}</b> проиграл! ({u_roll} против {b_roll} у бота). -{bet} 🪙"
             else:
                 res = f"🎲 Игрок <b>{u_name}</b> сыграл вничью! ({u_roll} и {b_roll}). Монеты сохранены."
 
         elif act.startswith("kaz_roul_"):
+            if bet < 20:
+                return await callback.answer("Для рулетки и зеро минимальная ставка 20 монет!", show_alert=True)
             choice = act.replace("kaz_roul_", "")
-            if coins < 50:
-                return await callback.answer("Нужно минимум 50 монет!", show_alert=True)
+            if coins < bet:
+                return await callback.answer(f"Нужно минимум {bet} монет!", show_alert=True)
 
             num = random.randint(0, 36)
             color = "zero" if num == 0 else ("red" if num % 2 == 1 else "black")
 
             if choice == color:
                 mult = 14 if choice == "zero" else 2
-                winnings = 50 * mult - 50
+                winnings = bet * mult - bet
                 await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (winnings, uid))
                 res = f"🎉 <b>{u_name}</b>, выпало {num} ({color})! Вы выиграли +{winnings} 🪙!"
             else:
-                await db.execute("UPDATE users SET femcoins = femcoins - 50 WHERE user_id = ?", (uid,))
-                res = f"💀 <b>{u_name}</b>, выпало {num} ({color})! Вы потеряли 50 🪙."
+                await db.execute("UPDATE users SET femcoins = femcoins - ? WHERE user_id = ?", (bet, uid))
+                res = f"💀 <b>{u_name}</b>, выпало {num} ({color})! Вы потеряли {bet} 🪙."
 
-        elif act == "kaz_slots_30":
-            if coins < 30:
-                return await callback.answer("Нужно 30 монет!", show_alert=True)
+        elif act == "kaz_slots":
+            if coins < bet:
+                return await callback.answer(f"Нужно {bet} монет!", show_alert=True)
             emojis = ["🍒", "🍋", "🍇", "💎", "7️⃣"]
             s1, s2, s3 = random.choices(emojis, k=3)
             if s1 == s2 == s3 == "7️⃣":
-                await db.execute("UPDATE users SET femcoins = femcoins + 470 WHERE user_id = ?", (uid,))
-                res = f"🎰 <b>{u_name}</b> [{s1}|{s2}|{s3}] ДЖЕКПОТ 777! +470 🪙!"
+                jackpot = bet * 15
+                await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (jackpot, uid))
+                res = f"🎰 <b>{u_name}</b> [{s1}|{s2}|{s3}] ДЖЕКПОТ 777! +{jackpot} 🪙!"
             elif s1 == s2 == s3:
-                await db.execute("UPDATE users SET femcoins = femcoins + 120 WHERE user_id = ?", (uid,))
-                res = f"🎰 <b>{u_name}</b> [{s1}|{s2}|{s3}] ТРИ В РЯД! +120 🪙!"
+                win_slots = bet * 4
+                await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (win_slots, uid))
+                res = f"🎰 <b>{u_name}</b> [{s1}|{s2}|{s3}] ТРИ В РЯД! +{win_slots} 🪙!"
             else:
-                await db.execute("UPDATE users SET femcoins = femcoins - 30 WHERE user_id = ?", (uid,))
-                res = f"🎰 <b>{u_name}</b> [{s1}|{s2}|{s3}] Не повезло! -30 🪙."
+                await db.execute("UPDATE users SET femcoins = femcoins - ? WHERE user_id = ?", (bet, uid))
+                res = f"🎰 <b>{u_name}</b> [{s1}|{s2}|{s3}] Не повезло! -{bet} 🪙."
 
         await db.commit()
 
     await callback.message.reply(res)
     await callback.answer()
+
+# ----------------- ФОНОВАЯ ЗАДАЧА: ПЕРЕКАТИ-ПОЛЕ (Сундук при неактивности) -----------------
+async def inactivity_chest_task():
+    """Каждую минуту проверяет чаты: если нет активности 15 минут, спавнит сундук"""
+    await asyncio.sleep(10)  # Задержка при старте бота
+    while True:
+        try:
+            now = time.time()
+            async with aiosqlite.connect(DB_NAME) as db:
+                async with db.execute("SELECT chat_id FROM chats") as cur:
+                    chats = await cur.fetchall()
+
+            for (chat_id,) in chats:
+                last_act = chat_last_activity.get(chat_id, 0)
+                # Если прошло больше 15 минут (900 секунд) с последнего сообщения в чате
+                if last_act > 0 and (now - last_act >= 900):
+                    # Обнуляем активность, чтобы сундук спавнился ровно раз в 15 минут простоя
+                    chat_last_activity[chat_id] = now
+
+                    chest_id = f"ch_idle_{int(now)}_{random.randint(100, 999)}"
+                    reward_coins = random.choices([20, 35, 50, 75, 120], weights=[45, 25, 18, 8, 4])[0]
+                    active_chests[chest_id] = {"coins": reward_coins, "claimed": False, "winner_name": None}
+
+                    chest_kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🎁 Забрать сундук!", callback_data=f"claim_chest_{chest_id}")]
+                    ])
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            "🌵 <b>В чате тихо... Тут прокатилось перекати-поле и оставило сундук!</b>\n"
+                            "<i>Кто первый нажмет на кнопку, заберет сокровища за простой чата!</i>",
+                            reply_markup=chest_kb
+                        )
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error(f"Inactivity chest error: {e}")
+
+        await asyncio.sleep(60)  # Проверка каждую минуту
 
 # ----------------- АДМИНИСТРАЦИЯ -----------------
 
@@ -1478,7 +1653,7 @@ async def mod_cd(message: Message):
     target_name = await get_user_display_name(target_id)
     exp = -1 if duration_hours == -1 else time.time() + duration_hours * 3600
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
+        async with db.execute("""
             UPDATE users 
             SET custom_cd_hours = ?, custom_cd_expires = ?
             WHERE user_id = ?
@@ -1509,6 +1684,8 @@ async def save_adm_text(message: Message, state: FSMContext):
 # ----------------- ЗАПУСК -----------------
 async def main():
     await init_db()
+    # Запускаем фоновую задачу для сундука при неактивности чатов (Перекати-поле)
+    asyncio.create_task(inactivity_chest_task())
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
