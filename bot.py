@@ -37,7 +37,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0").strip() or "0")
 DB_NAME = "fem_bot.db"
 
-# Настройки канала для бонуса
 CHANNEL_USERNAME = "@FM_femboy"
 CHANNEL_URL = "https://t.me/FM_femboy"
 
@@ -74,12 +73,10 @@ LUCK_WEIGHTS = {
 
 RARITY_ORDER = {r: i for i, r in enumerate(RARITIES)}
 
-# Хранилища
 active_chests: Dict[str, dict] = {}
 user_casino_bets: Dict[int, int] = {}
 chat_last_activity: Dict[int, float] = {}
 
-# ----------------- FSM СОСТОЯНИЯ -----------------
 class AdminStates(StatesGroup):
     waiting_for_photo = State()
     waiting_for_custom_desc = State()
@@ -114,13 +111,11 @@ async def init_db():
                 first_seen REAL DEFAULT 0
             )
         """)
-        # Миграция колонок на случай если таблица уже существовала
         for col_def in [
             "channel_bonus_claimed REAL DEFAULT 0",
             "last_weekly_bonus REAL DEFAULT 0",
             "first_seen REAL DEFAULT 0"
         ]:
-            col_name = col_def.split()[0]
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col_def}")
                 await db.commit()
@@ -253,7 +248,7 @@ async def add_log(admin_id: int, action: str):
         )
         await db.commit()
 
-# ----------------- НАСТРОЙКА СЕТИ -----------------
+# ----------------- СЕТЬ -----------------
 class TermuxAiohttpSession(AiohttpSession):
     async def create_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -277,12 +272,45 @@ bot = Bot(
 )
 dp = Dispatcher(storage=MemoryStorage())
 
-async def check_channel_subscription(user_id: int) -> bool:
+# Универсальный нормализатор команд из групп с @юзернеймом бота
+bot_username_cached: Optional[str] = None
+
+def get_normalized_command(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    token = text.strip().split()[0].lower()
+    if "@" in token:
+        token = token.split("@")[0]
+    return token
+
+def match_command(message: Message, aliases: List[str]) -> bool:
+    if not message.text:
+        return False
+    norm = get_normalized_command(message.text)
+    full_lower = message.text.strip().lower()
+    for a in aliases:
+        a_low = a.lower()
+        if norm == a_low or full_lower == a_low:
+            return True
+        if norm == f"/{a_low}" or full_lower == f"/{a_low}":
+            return True
+    return False
+
+# Проверка подписки с обработкой ошибок
+async def check_channel_subscription(user_id: int) -> tuple[bool, str]:
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        return member.status in ["creator", "administrator", "member"]
-    except Exception:
-        return False
+        status = str(getattr(member, "status", "")).lower()
+        # Включаем все допустимые статусы подписчика
+        if any(s in status for s in ["creator", "administrator", "member", "restricted"]):
+            return True, "ok"
+        return False, "not_member"
+    except Exception as e:
+        err_msg = str(e).lower()
+        logger.error(f"Subscription check error: {e}")
+        if "chat not found" in err_msg or "bot is not a member" in err_msg or "user not found" in err_msg:
+            return False, "bot_not_admin"
+        return False, "error"
 
 @dp.message.outer_middleware()
 async def register_middleware(handler, event: Message, data: dict):
@@ -293,31 +321,34 @@ async def register_middleware(handler, event: Message, data: dict):
         chat_last_activity[event.chat.id] = time.time()
     return await handler(event, data)
 
-# ----------------- ПОЛЬЗОВАТЕЛИ -----------------
+# ----------------- КОМАНДЫ ИГРОКОВ -----------------
 
-# 1. /foto или фем (устойчивый фильтр для любого регистра и пробелов)
-def is_fem_cmd(message: Message) -> bool:
-    if not message.text:
-        return False
-    t = message.text.strip().lower()
-    return t in ["/foto", "фем", "fem", "/fem", "/foto@"+(bot._me.username.lower() if bot._me else "")]
-
-@dp.message(lambda msg: is_fem_cmd(msg))
+# 1. /foto или фем
+@dp.message(lambda msg: match_command(msg, ["foto", "fem", "фем"]))
 async def fem_command(message: Message):
     uid = message.from_user.id
     now = time.time()
 
     async with aiosqlite.connect(DB_NAME) as db:
-        # Еженедельный бонус
         try:
             async with db.execute("SELECT channel_bonus_claimed, last_weekly_bonus FROM users WHERE user_id = ?", (uid,)) as cur:
                 b_row = await cur.fetchone()
                 if b_row and (b_row[0] or 0) > 0:
                     last_weekly = b_row[1] or 0
                     if now - last_weekly >= 604800:
-                        asyncio.create_task(process_weekly_sub(uid, now))
+                        is_sub, _ = await check_channel_subscription(uid)
+                        if is_sub:
+                            await db.execute("UPDATE users SET femcoins = femcoins + 50, last_weekly_bonus = ? WHERE user_id = ?", (now, uid))
+                            await db.commit()
+                            try:
+                                await bot.send_message(uid, "🎁 <b>Еженедельный бонус!</b>\nВам начислено <b>+50 🪙 фемкоинов</b> за подписку на ТГК!")
+                            except Exception:
+                                pass
+                        else:
+                            await db.execute("UPDATE users SET channel_bonus_claimed = 0 WHERE user_id = ?", (uid,))
+                            await db.commit()
         except Exception as e:
-            logger.warning(f"Weekly check error: {e}")
+            logger.warning(f"Weekly bonus check exception: {e}")
 
         async with db.execute(
             "SELECT last_fem_time, custom_cd_hours, custom_cd_expires, has_cd_reset, cd_reset_expires, luck_expires FROM users WHERE user_id = ?",
@@ -396,7 +427,6 @@ async def fem_command(message: Message):
 
     await message.answer_photo(photo=f_id, caption=caption, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
 
-    # 10% шанс спавна сундука
     if random.random() < 0.10:
         await asyncio.sleep(0.8)
         chest_id = f"ch_{int(time.time() * 1000)}_{random.randint(100, 999)}"
@@ -411,20 +441,6 @@ async def fem_command(message: Message):
             "<i>Кто первым нажмет на кнопку ниже, заберет все фемкоины себе!</i>",
             reply_markup=chest_kb
         )
-
-async def process_weekly_sub(uid: int, now: float):
-    if await check_channel_subscription(uid):
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE users SET femcoins = femcoins + 50, last_weekly_bonus = ? WHERE user_id = ?", (now, uid))
-            await db.commit()
-        try:
-            await bot.send_message(uid, "🎁 <b>Еженедельный бонус!</b>\nВам начислено <b>+50 🪙 фемкоинов</b> за подписку на ТГК!")
-        except Exception:
-            pass
-    else:
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE users SET channel_bonus_claimed = 0 WHERE user_id = ?", (uid,))
-            await db.commit()
 
 @dp.callback_query(F.data.startswith("claim_chest_"))
 async def open_chest_handler(callback: CallbackQuery):
@@ -483,10 +499,15 @@ async def start_cmd(message: Message):
 @dp.callback_query(F.data == "check_channel_sub")
 async def check_sub_callback(callback: CallbackQuery):
     uid = callback.from_user.id
-    is_sub = await check_channel_subscription(uid)
+    is_sub, err = await check_channel_subscription(uid)
 
     if not is_sub:
-        return await callback.answer("❌ Вы не подписаны на канал! Сначала подпишитесь.", show_alert=True)
+        if err == "bot_not_admin":
+            return await callback.answer(
+                "⚠️ Ошибка проверки: добавьте бота администратором в канал @FM_femboy, чтобы он мог видеть подписчиков!",
+                show_alert=True
+            )
+        return await callback.answer("❌ Вы ещё не подписались на канал! Подпишитесь и нажмите снова.", show_alert=True)
 
     now = time.time()
     async with aiosqlite.connect(DB_NAME) as db:
@@ -498,15 +519,15 @@ async def check_sub_callback(callback: CallbackQuery):
         await db.commit()
 
     await callback.message.edit_text(
-        "✅ <b>Подписка подтверждена!</b>\n\n"
-        "🔄 Кулдаун команды <code>фем</code> полностью сброшен!\n"
+        "✅ <b>Подписка успешно подтверждена!</b>\n\n"
+        "🔄 Кулдаун команды <code>фем</code> полностью сброшен (можно крутить прямо сейчас)!\n"
         "💰 Начислено: <b>+50 🪙 фемкоинов</b>.\n\n"
-        "⭐ <i>Внимание: 50 фемкоинов будут автоматически начисляться вам каждую неделю, пока вы подписаны на канал!</i>"
+        "⭐ <i>50 фемкоинов будут автоматически начисляться вам каждую неделю, пока вы подписаны на канал!</i>"
     )
     await callback.answer("Бонус успешно получен!")
 
-# 2. Передача фемкоинов с комиссией (передать / перевести / /pay / /transfer)
-@dp.message(lambda msg: msg.text and any(msg.text.lower().strip().startswith(prefix) for prefix in ["передать", "перевод", "/pay", "/transfer", "дать"]))
+# 2. Передача фемкоинов (передать, перевод, /pay, /transfer)
+@dp.message(lambda msg: msg.text and any(get_normalized_command(msg.text) == p or msg.text.lower().strip().startswith(p) for p in ["передать", "перевод", "/pay", "/transfer", "дать"]))
 async def transfer_coins_cmd(message: Message):
     sender_id = message.from_user.id
     parts = message.text.strip().split()
@@ -514,16 +535,14 @@ async def transfer_coins_cmd(message: Message):
     amount: Optional[int] = None
     target_id: Optional[int] = None
 
-    # Поиск суммы среди аргументов
     for p in parts[1:]:
         if p.isdigit():
             amount = int(p)
             break
 
     if not amount or amount <= 0:
-        return await message.reply("❗ Укажите корректную сумму для передачи!\nПример: <code>передать 100</code> (ответом на сообщение) или <code>передать @username 100</code>")
+        return await message.reply("❗ Укажите сумму для передачи!\nПример: <code>передать 100</code> (ответом на сообщение) или <code>передать @username 100</code>")
 
-    # Определение получателя: ответ на сообщение либо через @username
     if message.reply_to_message and message.reply_to_message.from_user:
         target_id = message.reply_to_message.from_user.id
     else:
@@ -543,12 +562,12 @@ async def transfer_coins_cmd(message: Message):
     if target_id == sender_id:
         return await message.reply("❌ Нельзя переводить фемкоины самому себе!")
 
-    COMMISSION_PERCENT = 10  # 10% комиссия (сгорает при переводе)
+    COMMISSION_PERCENT = 10
     burned = max(1, int(amount * COMMISSION_PERCENT / 100))
     received = amount - burned
 
     if received <= 0:
-        return await message.reply(f"❌ Сумма слишком мала для передачи с учетом комиссии {COMMISSION_PERCENT}%!")
+        return await message.reply("❌ Сумма слишком мала для передачи с учетом комиссии!")
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT femcoins FROM users WHERE user_id = ?", (sender_id,)) as cur:
@@ -556,11 +575,9 @@ async def transfer_coins_cmd(message: Message):
             sender_coins = s_row[0] if s_row else 0
 
         if sender_coins < amount:
-            return await message.reply(f"❌ Недостаточно фемкоинов! Ваш баланс: {sender_coins} 🪙, а требуется: {amount} 🪙.")
+            return await message.reply(f"❌ Недостаточно фемкоинов! Ваш баланс: {sender_coins} 🪙, а нужно: {amount} 🪙.")
 
-        # Списываем у отправителя
         await db.execute("UPDATE users SET femcoins = femcoins - ? WHERE user_id = ?", (amount, sender_id))
-        # Начисляем получателю (за вычетом комиссии)
         await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (received, target_id))
         await db.commit()
 
@@ -576,8 +593,8 @@ async def transfer_coins_cmd(message: Message):
         f"🔥 Комиссия (сгорело): <b>{burned} 🪙</b> ({COMMISSION_PERCENT}%)"
     )
 
-# 3. /profil или профиль
-@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/profil", "профиль", "/profile"])
+# 3. Профиль
+@dp.message(lambda msg: match_command(msg, ["profil", "profile", "профиль"]))
 async def profile_command(message: Message):
     await show_user_profile(message.chat.id, message.from_user, reply_to=message.message_id)
 
@@ -656,8 +673,8 @@ async def browse_cards(callback: CallbackQuery):
         await callback.message.answer_photo(photo=f_id, caption=text, reply_markup=kb)
     await callback.answer()
 
-# 4. /admin или кто админ
-@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/admin", "кто админ"])
+# 4. Кто админ
+@dp.message(lambda msg: match_command(msg, ["admin", "кто админ"]))
 async def who_admin(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT value FROM settings WHERE key = 'admin_info'") as cur:
@@ -665,8 +682,8 @@ async def who_admin(message: Message):
     text = row[0] if row else "Администратор ещё не настроил информацию о себе."
     await message.reply(text)
 
-# 5. /craft или крафт
-@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/craft", "крафт"])
+# 5. Крафт
+@dp.message(lambda msg: match_command(msg, ["craft", "крафт"]))
 async def craft_command(message: Message):
     uid = message.from_user.id
     async with aiosqlite.connect(DB_NAME) as db:
@@ -767,7 +784,7 @@ async def execute_craft(callback: CallbackQuery):
 # 6. Трейд
 trades: Dict[str, dict] = {}
 
-@dp.message(lambda msg: msg.text and msg.text.lower().strip().startswith("трейд"))
+@dp.message(lambda msg: msg.text and any(get_normalized_command(msg.text) == p or msg.text.lower().strip().startswith(p) for p in ["трейд", "/trade", "trade"]))
 async def trade_init(message: Message):
     if not message.reply_to_message or not message.reply_to_message.from_user:
         return await message.reply("❗ Команда должна быть ответом на сообщение игрока, с которым вы хотите обменяться!")
@@ -907,7 +924,7 @@ async def trade_confirm(callback: CallbackQuery):
     await callback.message.edit_text("🎉 <b>Обмен успешно завершён!</b> Игроки обменялись картами равной редкости.")
 
 # 7. Дейлик
-@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["дейлик", "/daily"])
+@dp.message(lambda msg: match_command(msg, ["daily", "дейлик"]))
 async def daily_command(message: Message):
     uid = message.from_user.id
     now = time.time()
@@ -945,8 +962,8 @@ async def daily_command(message: Message):
         f"<i>Не пропускайте дни, чтобы увеличивать бонус!</i>"
     )
 
-# 8. Топ 10 / топ 100 БЕЗ @ (чистые ники, не тегают)
-@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/top", "топ"])
+# 8. Топ без @
+@dp.message(lambda msg: match_command(msg, ["top", "топ"]))
 async def top_command(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("""
@@ -993,8 +1010,8 @@ async def send_top_100(callback: CallbackQuery):
     except Exception:
         await callback.answer("Сначала откройте диалог с ботом!", show_alert=True)
 
-# 9. /shop или магазин
-@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/shop", "магазин"])
+# 9. Магазин
+@dp.message(lambda msg: match_command(msg, ["shop", "магазин"]))
 async def shop_command(message: Message):
     bot_me = await bot.get_me()
     if message.chat.type != "private":
@@ -1117,8 +1134,8 @@ async def successful_payment_handler(message: Message):
             await db.commit()
         await message.reply(f"⭐ Оплата прошла успешно! Начислено <b>+{coins_to_add} 🪙 фемкоинов</b>.")
 
-# 10. /promo
-@dp.message(Command("promo"))
+# 10. Промокод
+@dp.message(lambda msg: match_command(msg, ["promo", "промо"]))
 async def promo_command(message: Message, state: FSMContext):
     await message.reply("🔑 Отправьте промокод следующим сообщением:")
     await state.set_state(UserStates.waiting_for_promo_code)
@@ -1168,18 +1185,19 @@ async def process_promo(message: Message, state: FSMContext):
     await state.clear()
     await message.reply(f"🎉 Промокод успешно активирован! Ваша награда: <b>{reward_msg}</b>")
 
-# 11. Казино
-@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["/kaz", "казино"])
-async def casino_menu(message: Message):
-    uid = message.from_user.id
-    current_bet = user_casino_bets.get(uid, 20)
+# 11. Казино (Яркие индикаторы выбранной ставки)
+def build_casino_kb(current_bet: int) -> InlineKeyboardMarkup:
+    b10 = f"[{current_bet}🪙]" if current_bet == 10 else "10 🪙"
+    b20 = f"[{current_bet}🪙]" if current_bet == 20 else "20 🪙"
+    b50 = f"[{current_bet}🪙]" if current_bet == 50 else "50 🪙"
+    b100 = f"[{current_bet}🪙]" if current_bet == 100 else "100 🪙"
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="10 🪙" + (" ✅" if current_bet==10 else ""), callback_data="setbet_10"),
-            InlineKeyboardButton(text="20 🪙" + (" ✅" if current_bet==20 else ""), callback_data="setbet_20"),
-            InlineKeyboardButton(text="50 🪙" + (" ✅" if current_bet==50 else ""), callback_data="setbet_50"),
-            InlineKeyboardButton(text="100 🪙" + (" ✅" if current_bet==100 else ""), callback_data="setbet_100")
+            InlineKeyboardButton(text=f"{'🔘 ' if current_bet==10 else ''}{b10}", callback_data="setbet_10"),
+            InlineKeyboardButton(text=f"{'🔘 ' if current_bet==20 else ''}{b20}", callback_data="setbet_20"),
+            InlineKeyboardButton(text=f"{'🔘 ' if current_bet==50 else ''}{b50}", callback_data="setbet_50"),
+            InlineKeyboardButton(text=f"{'🔘 ' if current_bet==100 else ''}{b100}", callback_data="setbet_100")
         ],
         [InlineKeyboardButton(text=f"🎲 Бросить кости (Ставка: {current_bet} 🪙)", callback_data="kaz_dice")],
         [
@@ -1189,9 +1207,15 @@ async def casino_menu(message: Message):
         [InlineKeyboardButton(text=f"🟢 Зеро (x14, {current_bet})", callback_data="kaz_roul_zero")],
         [InlineKeyboardButton(text=f"🎰 Слоты 777 (Ставка: {current_bet} 🪙)", callback_data="kaz_slots")]
     ])
+
+@dp.message(lambda msg: match_command(msg, ["kaz", "казино"]))
+async def casino_menu(message: Message):
+    uid = message.from_user.id
+    current_bet = user_casino_bets.get(uid, 20)
+    kb = build_casino_kb(current_bet)
     await message.reply(
         f"🎰 <b>Добро пожаловать в Фем-Казино!</b>\n"
-        f"Текущая ставка: <b>{current_bet} 🪙</b> (выберите ниже):\n"
+        f"🎯 Активная ставка: <b>{current_bet} 🪙</b> (переключайте кнопками в первом ряду):\n"
         f"<i>Для Зеро и Рулетки минимальная ставка 20 коинов.</i>",
         reply_markup=kb
     )
@@ -1201,30 +1225,15 @@ async def set_casino_bet(callback: CallbackQuery):
     bet_val = int(callback.data.replace("setbet_", ""))
     uid = callback.from_user.id
     user_casino_bets[uid] = bet_val
+    kb = build_casino_kb(bet_val)
 
-    current_bet = bet_val
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="10 🪙" + (" ✅" if current_bet==10 else ""), callback_data="setbet_10"),
-            InlineKeyboardButton(text="20 🪙" + (" ✅" if current_bet==20 else ""), callback_data="setbet_20"),
-            InlineKeyboardButton(text="50 🪙" + (" ✅" if current_bet==50 else ""), callback_data="setbet_50"),
-            InlineKeyboardButton(text="100 🪙" + (" ✅" if current_bet==100 else ""), callback_data="setbet_100")
-        ],
-        [InlineKeyboardButton(text=f"🎲 Бросить кости (Ставка: {current_bet} 🪙)", callback_data="kaz_dice")],
-        [
-            InlineKeyboardButton(text=f"🔴 Красное (x2, {current_bet})", callback_data="kaz_roul_red"),
-            InlineKeyboardButton(text=f"⚫ Черное (x2, {current_bet})", callback_data="kaz_roul_black")
-        ],
-        [InlineKeyboardButton(text=f"🟢 Зеро (x14, {current_bet})", callback_data="kaz_roul_zero")],
-        [InlineKeyboardButton(text=f"🎰 Слоты 777 (Ставка: {current_bet} 🪙)", callback_data="kaz_slots")]
-    ])
     await callback.message.edit_text(
         f"🎰 <b>Добро пожаловать в Фем-Казино!</b>\n"
-        f"Текущая ставка изменена на: <b>{current_bet} 🪙</b>\n"
+        f"🎯 Активная ставка переключена на: <b>{bet_val} 🪙</b>\n"
         f"<i>Выберите игру ниже:</i>",
         reply_markup=kb
     )
-    await callback.answer(f"Ставка установлена: {current_bet} 🪙")
+    await callback.answer(f"Ставка выбрана: {bet_val} 🪙")
 
 @dp.callback_query(F.data.startswith("kaz_"))
 async def casino_play(callback: CallbackQuery):
@@ -1292,7 +1301,7 @@ async def casino_play(callback: CallbackQuery):
     await callback.message.reply(res)
     await callback.answer()
 
-# Перекати-поле (Сундук при неактивности)
+# Перекати-поле
 async def inactivity_chest_task():
     await asyncio.sleep(10)
     while True:
@@ -1328,8 +1337,8 @@ async def inactivity_chest_task():
 
         await asyncio.sleep(60)
 
-# Админка
-@dp.message(Command("plus_foto"))
+# ----------------- АДМИНКА -----------------
+@dp.message(lambda msg: match_command(msg, ["plus_foto"]))
 async def plus_foto_cmd(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
@@ -1386,11 +1395,14 @@ async def view_cards_album(message: Message):
         await message.answer_media_group(media=media_group)
         await asyncio.sleep(0.5)
 
-@dp.message(F.text.regexp(r"^/card\s+(\d+)$"))
+@dp.message(lambda msg: msg.text and (msg.text.startswith("/card") or msg.text.startswith("card")))
 async def card_manage(message: Message):
     if not await is_admin(message.from_user.id):
         return
-    c_id = int(message.text.split()[1])
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return
+    c_id = int(parts[1])
 
     async with aiosqlite.connect(DB_NAME) as db:
         async with db.execute("SELECT file_id, rarity, description FROM cards WHERE id = ?", (c_id,)) as cur:
@@ -1473,7 +1485,7 @@ async def forced_profile(message: Message):
 
     await show_user_profile(message.chat.id, target_user)
 
-@dp.message(Command("admins"))
+@dp.message(lambda msg: match_command(msg, ["admins"]))
 async def list_admins(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1505,7 +1517,7 @@ async def remove_adm_cb(callback: CallbackQuery):
 
 broadcast_buffer: Dict[int, List[Message]] = {}
 
-@dp.message(Command("add"))
+@dp.message(lambda msg: match_command(msg, ["add"]))
 async def start_broadcast(message: Message, state: FSMContext):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1515,7 +1527,7 @@ async def start_broadcast(message: Message, state: FSMContext):
 
 @dp.message(AdminStates.broadcast_collecting)
 async def collect_broadcast(message: Message, state: FSMContext):
-    if message.text == "/save":
+    if message.text and match_command(message, ["save"]):
         msgs = broadcast_buffer.get(message.from_user.id, [])
         await state.clear()
         if not msgs:
@@ -1541,7 +1553,7 @@ async def collect_broadcast(message: Message, state: FSMContext):
     broadcast_buffer[message.from_user.id].append(message)
     await message.reply("Сообщение добавлено в буфер рассылки.")
 
-@dp.message(Command("now_admin_cod"))
+@dp.message(lambda msg: match_command(msg, ["now_admin_cod"]))
 async def gen_admin_code(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1559,7 +1571,7 @@ async def gen_admin_code(message: Message):
 
     await message.reply(f"🔑 Одноразовый код администратора: <code>{code}</code>\nДействует 3 часа.")
 
-@dp.message(Command("I_am_admin"))
+@dp.message(lambda msg: match_command(msg, ["I_am_admin"]))
 async def claim_admin(message: Message, state: FSMContext):
     await message.reply("Введите 10-значный код администратора:")
     await state.set_state(AdminStates.waiting_admin_code)
@@ -1643,7 +1655,7 @@ async def promo_manual_save(message: Message, state: FSMContext):
     await state.clear()
     await message.reply(f"✅ Промокод сохранен: <code>{code}</code>")
 
-@dp.message(Command("log"))
+@dp.message(lambda msg: match_command(msg, ["log"]))
 async def view_logs(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1674,7 +1686,7 @@ async def resolve_target(message: Message, arg_index: int = -1) -> Optional[int]
                 return row[0] if row else None
     return None
 
-@dp.message(lambda msg: msg.text and (msg.text.startswith("/бот +коины") or msg.text.startswith("/бот -коины")))
+@dp.message(lambda msg: msg.text and any(msg.text.startswith(p) for p in ["/бот +коины", "/бот -коины", "бот +коины", "бот -коины"]))
 async def mod_coins(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1696,7 +1708,7 @@ async def mod_coins(message: Message):
     await add_log(message.from_user.id, f"{'+' if is_plus else '-'}{amount} коинов для {target_name}")
     await message.reply(f"Баланс игрока <b>{target_name}</b> изменен на {'+' if is_plus else '-'}{amount} 🪙.")
 
-@dp.message(lambda msg: msg.text and (msg.text.startswith("/бот +карта") or msg.text.startswith("/бот -карта")))
+@dp.message(lambda msg: msg.text and any(msg.text.startswith(p) for p in ["/бот +карта", "/бот -карта", "бот +карта", "бот -карта"]))
 async def mod_cards(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1725,7 +1737,7 @@ async def mod_cards(message: Message):
     await add_log(message.from_user.id, action_desc)
     await message.reply(f"Готово: {action_desc}.")
 
-@dp.message(lambda msg: msg.text and msg.text.startswith("/бот кд"))
+@dp.message(lambda msg: msg.text and any(msg.text.startswith(p) for p in ["/бот кд", "бот кд"]))
 async def mod_cd(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
@@ -1750,7 +1762,7 @@ async def mod_cd(message: Message):
     await add_log(message.from_user.id, f"Установлен КД {new_cd}ч игроку {target_name} на {duration_hours}ч")
     await message.reply(f"Игроку <b>{target_name}</b> установлен КД {new_cd} ч на {duration_hours} ч.")
 
-@dp.message(Command("set_adm_text"))
+@dp.message(lambda msg: match_command(msg, ["set_adm_text"]))
 async def set_adm_text_cmd(message: Message, state: FSMContext):
     if not await is_admin(message.from_user.id):
         return
