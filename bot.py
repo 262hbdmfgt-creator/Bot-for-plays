@@ -28,7 +28,6 @@ from aiogram.types import (
     Message,
     LabeledPrice,
     PreCheckoutQuery,
-    ChatMemberUpdated,
 )
 
 # Загружаем настройки из .env
@@ -112,25 +111,6 @@ async def init_db():
                 first_seen REAL DEFAULT 0
             )
         """)
-        
-        # --- ДОБАВЛЕНО: Таблицы рефералов ---
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS referrals (
-                user_id INTEGER PRIMARY KEY,
-                referrer_id INTEGER,
-                timestamp REAL
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS referral_groups (
-                chat_id INTEGER PRIMARY KEY,
-                creator_id INTEGER,
-                referrer_id INTEGER,
-                timestamp REAL
-            )
-        """)
-        # ------------------------------------
-
         for col_def in [
             "channel_bonus_claimed REAL DEFAULT 0",
             "last_weekly_bonus REAL DEFAULT 0",
@@ -489,39 +469,9 @@ async def open_chest_handler(callback: CallbackQuery):
     )
     await callback.answer(f"Поздравляем! +{reward} фемкоинов ваши!")
 
-# --- ИЗМЕНЕНО: Хендлер Старта для рефералов ---
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     args = message.text.split()
-    
-    # Реферальная логика
-    if len(args) > 1 and args[1].startswith("ref_"):
-        try:
-            referrer_id = int(args[1].replace("ref_", ""))
-            uid = message.from_user.id
-            if referrer_id != uid:
-                async with aiosqlite.connect(DB_NAME) as db:
-                    # Проверяем, есть ли уже этот пользователь в базе
-                    async with db.execute("SELECT 1 FROM users WHERE user_id = ?", (uid,)) as cur:
-                        is_new = not bool(await cur.fetchone())
-                    
-                    if is_new:
-                        await db.execute(
-                            "INSERT OR IGNORE INTO referrals (user_id, referrer_id, timestamp) VALUES (?, ?, ?)",
-                            (uid, referrer_id, time.time())
-                        )
-                        await db.commit()
-                    
-                    # Если команда выполнена в группе (добавление через ссылку)
-                    if message.chat.type in ["group", "supergroup"]:
-                        await db.execute(
-                            "INSERT OR IGNORE INTO referral_groups (chat_id, creator_id, referrer_id, timestamp) VALUES (?, ?, ?, ?)",
-                            (message.chat.id, 0, referrer_id, time.time()) # creator_id обновится хендлером
-                        )
-                        await db.commit()
-        except Exception:
-            pass
-
     if len(args) > 1 and args[1] == "bonus":
         if message.chat.type != "private":
             bot_me = await bot.get_me()
@@ -544,63 +494,6 @@ async def start_cmd(message: Message):
         return await shop_command(message)
 
     await message.reply("👋 Привет! Я игровой бот. Напиши <b>фем</b> или /foto, чтобы начать.")
-
-# --- ДОБАВЛЕНО: Команда /ref и триггеры ---
-@dp.message(lambda msg: match_command(msg, ["ref", "реф", "заработок", "реферал"]))
-async def referral_info_cmd(message: Message):
-    uid = message.from_user.id
-    bot_me = await bot.get_me()
-    
-    user_ref_link = f"https://t.me/{bot_me.username}?start=ref_{uid}"
-    group_ref_link = f"https://t.me/{bot_me.username}?startgroup=ref_{uid}"
-    
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (uid,)) as cur:
-            refs_count = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM referral_groups WHERE referrer_id = ? OR creator_id = ?", (uid, uid)) as cur:
-            groups_count = (await cur.fetchone())[0]
-
-    # Сообщение 1: Реклама приглашений
-    await message.answer(
-        f"💰 <b>Зарабатывай фемкоины на приглашениях!</b>\n\n"
-        f"Приглашай новых пользователей в бота и получай бонусы за их активность! Чем больше друзей — тем богаче коллекция.\n\n"
-        f"🔗 <b>Твоя ссылка для друзей:</b>\n<code>{user_ref_link}</code>\n\n"
-        f"📈 У тебя уже приглашено: <b>{refs_count}</b> чел."
-    )
-
-    # Сообщение 2: Реклама добавления в чаты
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить в чат", url=group_ref_link)]
-    ])
-    await message.answer(
-        f"📢 <b>Твой пассивный доход в группах!</b>\n\n"
-        f"Добавляй бота в чаты, где ты являешься создателем или администратором. Мы поощряем владельцев активных фем-сообществ!\n\n"
-        f"⭐ Твоих чатов в системе: <b>{groups_count}</b>\n"
-        f"<i>Нажми кнопку ниже, чтобы привязать группу:</i>",
-        reply_markup=kb
-    )
-
-# --- ДОБАВЛЕНО: Отслеживание создателей групп ---
-@dp.my_chat_member()
-async def on_my_chat_member(event: ChatMemberUpdated):
-    # Если бота добавили в группу
-    if event.new_chat_member.status in ["member", "administrator"]:
-        if event.chat.type in ["group", "supergroup"]:
-            try:
-                admins = await bot.get_chat_administrators(event.chat.id)
-                creator = next((adm for adm in admins if adm.status == "creator"), None)
-                if creator:
-                    async with aiosqlite.connect(DB_NAME) as db:
-                        await db.execute(
-                            "INSERT INTO referral_groups (chat_id, creator_id, timestamp) VALUES (?, ?, ?) "
-                            "ON CONFLICT(chat_id) DO UPDATE SET creator_id = excluded.creator_id",
-                            (event.chat.id, creator.user.id, time.time())
-                        )
-                        await db.commit()
-            except Exception:
-                pass
-
-# ----------------- ДАЛЕЕ ВАШ ОРИГИНАЛЬНЫЙ КОД БЕЗ ИЗМЕНЕНИЙ -----------------
 
 @dp.callback_query(F.data == "check_channel_sub")
 async def check_sub_callback(callback: CallbackQuery):
