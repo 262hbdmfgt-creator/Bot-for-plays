@@ -993,7 +993,6 @@ def is_set_inactivity_cmd(text: Optional[str]) -> bool:
 
 @dp.message(lambda msg: is_set_inactivity_cmd(msg.text))
 async def set_inactivity_interval_cmd(message: Message):
-    # Только супер админ и только в группе
     if message.from_user.id != SUPER_ADMIN_ID:
         return
     if message.chat.type not in ["group", "supergroup"]:
@@ -1051,17 +1050,14 @@ async def inactivity_chest_task():
                     chats = await cur.fetchall()
 
             for chat_id, interval in chats:
-                # Проверяем, что в чате больше 30 участников
                 try:
                     member_count = await bot.get_chat_member_count(chat_id)
                     if member_count < 30:
                         continue
                 except Exception:
-                    # Если не удалось получить количество участников, пропускаем или считаем по умолчанию
                     pass
 
                 last_act = chat_last_activity.get(chat_id, 0)
-                # По умолчанию во всех чатах перекати-поле появляется раз в час (3600 сек)
                 inv = interval if (interval and interval > 0) else 3600
                 
                 if last_act > 0 and (now - last_act >= inv):
@@ -1839,9 +1835,7 @@ def get_chat_vip_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🪙 Купить за фемкоины", callback_data="vip_pay_femcoins")]
     ])
 
-@dp.message(lambda msg: msg.text and any(
-    match_command(msg, ["vip", "вип", "купить вип"]) or msg.text.lower().strip() in ["vip", "вип", "купить вип"]
-))
+@dp.message(lambda msg: msg.text and (match_command(msg, ["vip", "вип", "купить вип"]) or msg.text.lower().strip() in ["vip", "вип", "купить вип"]))
 async def vip_section_trigger(message: Message):
     is_private = (message.chat.type == "private")
     kb = get_chat_vip_kb()
@@ -2432,7 +2426,7 @@ async def mod_cd(message: Message):
     target_name = await get_user_display_name(target_id, clean=True)
     exp = -1 if duration_hours == -1 else time.time() + duration_hours * 3600
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
+        async with db.execute("""
             UPDATE users 
             SET custom_cd_hours = ?, custom_cd_expires = ?
             WHERE user_id = ?
@@ -2449,12 +2443,16 @@ async def set_adm_text_cmd(message: Message, state: FSMContext):
     await message.reply("Отправьте текст, который будет выводиться по команде «кто админ»:")
     await state.set_state(AdminStates.waiting_set_adm_text)
 
+@dp.message(AdminStates.waiting_clear) # dummy
+async def dummy_clear():
+    pass
+
 @dp.message(AdminStates.waiting_set_adm_text)
 async def save_adm_text(message: Message, state: FSMContext):
     text = message.text
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_info', ?)", (text,))
-        await db.commit()
+        async with db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_info', ?)", (text,)) as db_commit:
+            await db.commit()
     await state.clear()
     admin_name = await get_user_display_name(message.from_user.id, clean=True)
     await add_log(message.from_user.id, f"{admin_name} обновил текст 'кто админ'")
