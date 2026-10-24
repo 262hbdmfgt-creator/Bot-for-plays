@@ -1,100 +1,49 @@
-# =========================
-# BLOCK 1/5 — ОСНОВА БОТА
-# =========================
-
 import asyncio
-import html
 import logging
 import os
 import random
-import re
-import secrets
+import socket
 import string
 import time
-from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional, List, Dict
 
+import aiohttp
 import aiosqlite
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
-    LabeledPrice,
+    CallbackQuery,
     Message,
+    LabeledPrice,
     PreCheckoutQuery,
 )
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-
-# -------------------------
-# CONFIG
-# -------------------------
-
+# Загружаем настройки из .env
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-SUPER_ADMIN_ID_RAW = os.getenv("SUPER_ADMIN_ID", "").strip()
-SUPER_ADMIN_ID = int(SUPER_ADMIN_ID_RAW or "0")
-
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@FM_femboy").strip()
-CHANNEL_URL = os.getenv(
-    "CHANNEL_URL",
-    "https://t.me/FM_femboy",
-).strip()
-
+SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0").strip() or "0")
 DB_NAME = "fem_bot.db"
 
-if not BOT_TOKEN:
-    raise RuntimeError("В .env не указан BOT_TOKEN")
+CHANNEL_USERNAME = "@FM_femboy"
+CHANNEL_URL = "https://t.me/FM_femboy"
 
-if not SUPER_ADMIN_ID:
-    raise RuntimeError("В .env не указан SUPER_ADMIN_ID")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-
-# -------------------------
-# LOGGING
-# -------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-
-logger = logging.getLogger("fembot")
-
-
-# -------------------------
-# BOT
-# -------------------------
-
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(
-        parse_mode=ParseMode.HTML,
-    ),
-)
-
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-dp.include_router(router)
-
-
-# -------------------------
-# CONSTANTS
-# -------------------------
-
+# Редкости и веса карт
 RARITIES = [
     "Редкое",
     "Ультра редкое",
@@ -103,11 +52,6 @@ RARITIES = [
     "Фембойский артефакт",
     "Редчайший фем",
 ]
-
-RARITY_ORDER = {
-    rarity: index
-    for index, rarity in enumerate(RARITIES)
-}
 
 BASE_WEIGHTS = {
     "Редкое": 58.0,
@@ -127,6 +71,7 @@ LUCK_WEIGHTS = {
     "Редчайший фем": 1.5,
 }
 
+# Веса для VIP (чуть уменьшен шанс Редкого, повышен Ультра и Мифическое)
 VIP_WEIGHTS = {
     "Редкое": 52.0,
     "Ультра редкое": 31.0,
@@ -136,7 +81,10 @@ VIP_WEIGHTS = {
     "Редчайший фем": 0.1,
 }
 
-DUPLICATE_COMPENSATION = {
+RARITY_ORDER = {r: i for i, r in enumerate(RARITIES)}
+
+# Компенсация за дубликаты для VIP
+DUP_COMPENSATION = {
     "Редкое": 5,
     "Ультра редкое": 10,
     "Мифическое": 15,
@@ -145,5611 +93,2380 @@ DUPLICATE_COMPENSATION = {
     "Редчайший фем": 30,
 }
 
-DAILY_REWARDS = {
-    "normal_hours": 24,
-    "vip_hours": 22,
-    "maximum_streak": 30,
-}
-
-CHEST_REWARDS = {
-    "normal": (5, 49),
-    "rare": (50, 99),
-    "legendary": (100, 199),
-}
-
-ARTIFACT_TYPES = {
-    "blade",
-    "armor",
-    "shield",
-}
-
-SHIELD_TYPES = {
-    "weak",
-    "reinforced",
-    "femboy",
-}
-
-CASINO_BETS = {10, 20, 50, 100}
-
-# Временные данные интерфейса.
-# Денежные операции и награды в дальнейшем будут дополнительно
-# защищены транзакциями SQLite.
-user_casino_bets: dict[int, int] = {}
-active_tasks: set[asyncio.Task] = set()
-chat_activity_memory: dict[int, float] = {}
-trade_locks: dict[str, asyncio.Lock] = {}
-callback_locks: dict[str, asyncio.Lock] = {}
-
-
-# -------------------------
-# FSM
-# -------------------------
+active_chests: Dict[str, dict] = {}
+user_casino_bets: Dict[int, int] = {}
+chat_last_activity: Dict[int, float] = {}
 
 class AdminStates(StatesGroup):
-    waiting_photo = State()
-    waiting_card_description = State()
+    waiting_for_photo = State()
+    waiting_for_custom_desc = State()
+    waiting_for_new_desc = State()
+    broadcast_collecting = State()
     waiting_admin_code = State()
-    waiting_broadcast = State()
-    waiting_promo_code = State()
-    waiting_admin_text = State()
-
+    waiting_custom_promo = State()
+    waiting_set_adm_text = State()
 
 class UserStates(StatesGroup):
-    waiting_promo_code = State()
+    waiting_for_promo_code = State()
+    waiting_for_trade_offer = State()
 
-
-# -------------------------
-# BASIC HELPERS
-# -------------------------
-
-def now_ts() -> float:
-    return time.time()
-
-
-def esc(value: Any) -> str:
-    """Безопасное HTML-экранирование пользовательского текста."""
-    return html.escape(str(value or ""), quote=False)
-
-
-def short_time(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-
-    if hours:
-        return f"{hours}ч {minutes}м"
-    if minutes:
-        return f"{minutes}м {secs}с"
-    return f"{secs}с"
-
-
-def format_date(timestamp: float) -> str:
-    if not timestamp:
-        return ""
-    return datetime.fromtimestamp(timestamp).strftime("%d.%m.%Y %H:%M")
-
-
-def normalize_command(text: Optional[str]) -> str:
-    if not text:
-        return ""
-
-    first = text.strip().split(maxsplit=1)[0].lower()
-
-    if "@" in first:
-        first = first.split("@", 1)[0]
-
-    return first
-
-
-def command_is(message: Message, *aliases: str) -> bool:
-    command = normalize_command(message.text)
-    normalized = {
-        alias.lower() if alias.startswith("/") else f"/{alias.lower()}"
-        for alias in aliases
-    }
-    return command in normalized
-
-
-def parse_callback(callback_data: str, prefix: str) -> Optional[str]:
-    """
-    Безопасный разбор callback_data.
-    Не использует split('_'), поэтому ID с подчёркиваниями поддерживаются.
-    """
-    if not callback_data.startswith(prefix):
-        return None
-    return callback_data[len(prefix):]
-
-
-def make_token(length: int = 16) -> str:
-    alphabet = string.ascii_letters + string.digits
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-def display_name(user: types.User) -> str:
-    if user.username:
-        return f"@{esc(user.username)}"
-    return esc(user.full_name or str(user.id))
-
-
-async def safe_callback_answer(
-    callback: CallbackQuery,
-    text: Optional[str] = None,
-    *,
-    show_alert: bool = False,
-) -> None:
-    try:
-        await callback.answer(text or "", show_alert=show_alert)
-    except Exception:
-        logger.exception("Ошибка callback.answer")
-
-
-async def safe_edit_text(
-    message: Message,
-    text: str,
-    reply_markup: Optional[InlineKeyboardMarkup] = None,
-) -> None:
-    try:
-        await message.edit_text(text, reply_markup=reply_markup)
-    except TelegramBadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
-            logger.warning("Не удалось изменить сообщение: %s", exc)
-    except Exception:
-        logger.exception("Ошибка редактирования сообщения")
-
-
-async def log_action(
-    admin_id: int,
-    action: str,
-) -> None:
-    try:
-        async with db_connection() as db:
-            await db.execute(
-                """
-                INSERT INTO logs(admin_id, action, timestamp)
-                VALUES (?, ?, ?)
-                """,
-                (admin_id, action[:2000], now_ts()),
-            )
-            await db.commit()
-    except Exception:
-        logger.exception("Ошибка записи лога")
-
-
-# -------------------------
-# DATABASE CONNECTION
-# -------------------------
-
-@asynccontextmanager
-async def db_connection():
-    db = await aiosqlite.connect(DB_NAME)
-    db.row_factory = aiosqlite.Row
-
-    await db.execute("PRAGMA foreign_keys = ON")
-    await db.execute("PRAGMA busy_timeout = 10000")
-
-    try:
-        yield db
-    finally:
-        await db.close()
-
-
-async def table_columns(
-    db: aiosqlite.Connection,
-    table_name: str,
-) -> set[str]:
-    result: set[str] = set()
-
-    async with db.execute(
-        f"PRAGMA table_info({table_name})"
-    ) as cursor:
-        async for row in cursor:
-            result.add(row["name"])
-
-    return result
-
-
-async def ensure_columns(
-    db: aiosqlite.Connection,
-    table_name: str,
-    columns: dict[str, str],
-) -> None:
-    existing = await table_columns(db, table_name)
-
-    for column, definition in columns.items():
-        if column in existing:
-            continue
-
-        try:
-            await db.execute(
-                f"ALTER TABLE {table_name} ADD COLUMN "
-                f"{column} {definition}"
-            )
-            logger.info(
-                "Добавлена колонка %s.%s",
-                table_name,
-                column,
-            )
-        except Exception:
-            logger.exception(
-                "Ошибка миграции %s.%s",
-                table_name,
-                column,
-            )
-
-
-async def init_database() -> None:
-    async with db_connection() as db:
-        await db.executescript(
-            """
+# ----------------- БАЗА ДАННЫХ -----------------
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
-                femcoins INTEGER NOT NULL DEFAULT 100,
-                last_fem_time REAL NOT NULL DEFAULT 0,
-                custom_cd_hours REAL NOT NULL DEFAULT 3,
-                custom_cd_expires REAL NOT NULL DEFAULT 0,
-                daily_streak INTEGER NOT NULL DEFAULT 0,
-                last_daily_time REAL NOT NULL DEFAULT 0,
-                referred_by INTEGER NOT NULL DEFAULT 0,
-                referral_reward_given INTEGER NOT NULL DEFAULT 0,
-                vip_until REAL NOT NULL DEFAULT 0,
-                luck_expires REAL NOT NULL DEFAULT 0,
-                cd_resets_count INTEGER NOT NULL DEFAULT 0,
-                cd_reset_expires REAL NOT NULL DEFAULT 0,
-                channel_bonus_claimed REAL NOT NULL DEFAULT 0,
-                last_weekly_bonus REAL NOT NULL DEFAULT 0,
-                attack_block_until REAL NOT NULL DEFAULT 0,
-                blade_hidden INTEGER NOT NULL DEFAULT 0,
-                armor_hidden INTEGER NOT NULL DEFAULT 0,
-                first_seen REAL NOT NULL DEFAULT 0
-            );
+                femcoins INTEGER DEFAULT 100,
+                last_fem_time REAL DEFAULT 0,
+                custom_cd_hours REAL DEFAULT 3.0,
+                custom_cd_expires REAL DEFAULT 0,
+                has_cd_reset INTEGER DEFAULT 0,
+                cd_reset_expires REAL DEFAULT 0,
+                luck_expires REAL DEFAULT 0,
+                daily_streak INTEGER DEFAULT 0,
+                last_daily_time REAL DEFAULT 0,
+                channel_bonus_claimed REAL DEFAULT 0,
+                last_weekly_bonus REAL DEFAULT 0,
+                referred_by INTEGER DEFAULT 0,
+                referral_reward_given INTEGER DEFAULT 0,
+                first_seen REAL DEFAULT 0,
+                vip_until REAL DEFAULT 0,
+                cd_resets_count INTEGER DEFAULT 0
+            )
+        """)
+        for col_def in [
+            "channel_bonus_claimed REAL DEFAULT 0",
+            "last_weekly_bonus REAL DEFAULT 0",
+            "referred_by INTEGER DEFAULT 0",
+            "referral_reward_given INTEGER DEFAULT 0",
+            "first_seen REAL DEFAULT 0",
+            "vip_until REAL DEFAULT 0",
+            "cd_resets_count INTEGER DEFAULT 0"
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_def}")
+                await db.commit()
+            except Exception:
+                pass
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                added_at REAL
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS cards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_id TEXT NOT NULL,
                 rarity TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT ''
-            );
-
+                description TEXT DEFAULT ''
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                card_id INTEGER NOT NULL,
-                count INTEGER NOT NULL DEFAULT 1,
-                UNIQUE(user_id, card_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS artifacts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                artifact_type TEXT NOT NULL,
-                subtype TEXT NOT NULL DEFAULT '',
-                amount INTEGER NOT NULL DEFAULT 1,
-                hidden_amount INTEGER NOT NULL DEFAULT 0,
-                blocked_until REAL NOT NULL DEFAULT 0,
-                created_at REAL NOT NULL DEFAULT 0,
-                UNIQUE(user_id, artifact_type, subtype)
-            );
-
-            CREATE TABLE IF NOT EXISTS admins (
-                user_id INTEGER PRIMARY KEY,
-                added_by INTEGER NOT NULL DEFAULT 0,
-                added_at REAL NOT NULL DEFAULT 0
-            );
-
+                user_id INTEGER,
+                card_id INTEGER,
+                count INTEGER DEFAULT 1,
+                FOREIGN KEY (card_id) REFERENCES cards(id)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY,
-                chat_type TEXT NOT NULL DEFAULT '',
-                inactivity_interval REAL NOT NULL DEFAULT 3600,
-                last_activity REAL NOT NULL DEFAULT 0,
-                last_chest_at REAL NOT NULL DEFAULT 0
-            );
+                chat_type TEXT,
+                inactivity_interval REAL DEFAULT 3600
+            )
+        """)
+        try:
+            await db.execute("ALTER TABLE chats ADD COLUMN inactivity_interval REAL DEFAULT 3600")
+            await db.commit()
+        except Exception:
+            pass
 
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS group_rewards (
                 chat_id INTEGER PRIMARY KEY,
-                owner_id INTEGER NOT NULL DEFAULT 0,
-                reward_claimed INTEGER NOT NULL DEFAULT 0,
-                member_count INTEGER NOT NULL DEFAULT 0,
-                rewarded_at REAL NOT NULL DEFAULT 0
-            );
-
+                owner_id INTEGER,
+                reward_claimed INTEGER DEFAULT 1
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS owner_group_counts (
                 owner_id INTEGER PRIMARY KEY,
-                count INTEGER NOT NULL DEFAULT 0
-            );
-
+                count INTEGER DEFAULT 0
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS promo_codes (
                 code TEXT PRIMARY KEY,
-                p_type TEXT NOT NULL,
-                reward_type TEXT NOT NULL,
-                reward_val INTEGER NOT NULL DEFAULT 0,
-                expires_at REAL NOT NULL,
-                is_used INTEGER NOT NULL DEFAULT 0
-            );
-
+                p_type TEXT,
+                reward_type TEXT,
+                reward_val INTEGER,
+                expires_at REAL,
+                is_used INTEGER DEFAULT 0
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS promo_claims (
-                user_id INTEGER NOT NULL,
-                code TEXT NOT NULL,
-                claimed_at REAL NOT NULL,
+                user_id INTEGER,
+                code TEXT,
+                claimed_at REAL,
                 PRIMARY KEY(user_id, code)
-            );
-
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS admin_codes (
                 code TEXT PRIMARY KEY,
-                created_by INTEGER NOT NULL,
-                expires_at REAL NOT NULL,
-                used INTEGER NOT NULL DEFAULT 0
-            );
-
+                created_by INTEGER,
+                expires_at REAL,
+                used INTEGER DEFAULT 0
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
-            );
-
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_id INTEGER NOT NULL DEFAULT 0,
-                action TEXT NOT NULL,
-                timestamp REAL NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS trades (
-                trade_id TEXT PRIMARY KEY,
-                p1 INTEGER NOT NULL,
-                p2 INTEGER NOT NULL,
-                p1_card INTEGER,
-                p2_card INTEGER,
-                p1_confirmed INTEGER NOT NULL DEFAULT 0,
-                p2_confirmed INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'pending',
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS chests (
-                chest_id TEXT PRIMARY KEY,
-                chat_id INTEGER NOT NULL,
-                message_id INTEGER,
-                chest_type TEXT NOT NULL,
-                payload TEXT NOT NULL DEFAULT '',
-                claimed_by INTEGER,
-                claimed_at REAL,
-                created_at REAL NOT NULL,
-                expires_at REAL NOT NULL
-            );
-            """
-        )
-
-        await ensure_columns(
-            db,
-            "users",
-            {
-                "attack_block_until": "REAL NOT NULL DEFAULT 0",
-                "blade_hidden": "INTEGER NOT NULL DEFAULT 0",
-                "armor_hidden": "INTEGER NOT NULL DEFAULT 0",
-                "first_seen": "REAL NOT NULL DEFAULT 0",
-                "referral_reward_given": "INTEGER NOT NULL DEFAULT 0",
-                "vip_until": "REAL NOT NULL DEFAULT 0",
-                "luck_expires": "REAL NOT NULL DEFAULT 0",
-                "cd_resets_count": "INTEGER NOT NULL DEFAULT 0",
-                "cd_reset_expires": "REAL NOT NULL DEFAULT 0",
-            },
-        )
-
-        await ensure_columns(
-            db,
-            "chats",
-            {
-                "last_activity": "REAL NOT NULL DEFAULT 0",
-                "last_chest_at": "REAL NOT NULL DEFAULT 0",
-            },
-        )
-
-        await ensure_columns(
-            db,
-            "group_rewards",
-            {
-                "member_count": "INTEGER NOT NULL DEFAULT 0",
-                "rewarded_at": "REAL NOT NULL DEFAULT 0",
-            },
-        )
-
-        await db.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS
-            idx_inventory_user_card
-            ON inventory(user_id, card_id)
-            """
-        )
-
-        await db.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_inventory_user
-            ON inventory(user_id)
-            """
-        )
-
-        await db.execute(
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_artifacts_user
-            ON artifacts(user_id)
-            """
-        )
-
-        await db.execute(
-            """
-            UPDATE users
-            SET first_seen = ?
-            WHERE first_seen = 0
-            """,
-            (now_ts(),),
-        )
-
+                admin_id INTEGER,
+                action TEXT,
+                timestamp REAL
+            )
+        """)
         await db.commit()
 
-    logger.info("База данных инициализирована")
-
-
-# -------------------------
-# TRANSACTION HELPERS
-# -------------------------
-
-@asynccontextmanager
-async def transaction():
-    async with db_connection() as db:
-        await db.execute("BEGIN IMMEDIATE")
-
-        try:
-            yield db
-        except Exception:
-            await db.rollback()
-            raise
-        else:
-            await db.commit()
-
-
-async def ensure_user(
-    user: types.User,
-    referred_by: int = 0,
-) -> bool:
-    """
-    Создаёт пользователя при необходимости.
-    Возвращает True, если пользователь был создан впервые.
-    """
-    user_id = user.id
-    username = user.username or user.full_name or str(user_id)
-    valid_referrer = (
-        referred_by
-        if referred_by > 0 and referred_by != user_id
-        else 0
-    )
-
-    async with transaction() as db:
-        async with db.execute(
-            "SELECT user_id FROM users WHERE user_id = ?",
-            (user_id,),
-        ) as cursor:
-            existing = await cursor.fetchone()
-
-        if existing:
-            await db.execute(
-                """
-                UPDATE users
-                SET username = ?
-                WHERE user_id = ?
-                """,
-                (username, user_id),
-            )
-            return False
-
+async def register_chat(chat_id: int, chat_type: str):
+    async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
-            """
-            INSERT INTO users(
-                user_id,
-                username,
-                referred_by,
-                first_seen
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                username,
-                valid_referrer,
-                now_ts(),
-            ),
+            "INSERT OR IGNORE INTO chats (chat_id, chat_type, inactivity_interval) VALUES (?, ?, 3600)",
+            (chat_id, chat_type),
         )
+        await db.commit()
 
-        return True
+async def get_or_create_user(user: types.User, ref_id: int = 0) -> tuple[bool, bool]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id, username, referred_by FROM users WHERE user_id = ?", (user.id,)) as cur:
+            row = await cur.fetchone()
+            curr_name = user.username or user.full_name
+            if not row:
+                now = time.time()
+                valid_ref = ref_id if (ref_id > 0 and ref_id != user.id) else 0
+                await db.execute(
+                    "INSERT INTO users (user_id, username, referred_by, referral_reward_given, first_seen) VALUES (?, ?, ?, 0, ?)",
+                    (user.id, curr_name, valid_ref, now),
+                )
+                await db.commit()
+                return True, (valid_ref > 0)
+            else:
+                if row[1] != curr_name:
+                    await db.execute(
+                        "UPDATE users SET username = ? WHERE user_id = ?",
+                        (curr_name, user.id),
+                    )
+                    await db.commit()
+                return False, False
 
+async def disqualify_referral(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE users SET referral_reward_given = 2 WHERE user_id = ? AND referred_by > 0 AND referral_reward_given = 0",
+            (user_id,)
+        )
+        await db.commit()
 
-async def user_exists(user_id: int) -> bool:
-    async with db_connection() as db:
-        async with db.execute(
-            "SELECT 1 FROM users WHERE user_id = ?",
-            (user_id,),
-        ) as cursor:
-            return await cursor.fetchone() is not None
-
+async def user_has_activity(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT 1 FROM inventory WHERE user_id = ? LIMIT 1", (user_id,)) as cur:
+            if await cur.fetchone():
+                return True
+        async with db.execute("SELECT last_fem_time, daily_streak, referral_reward_given FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            if row and (row[0] > 0 or row[1] > 0 or row[2] == 2):
+                return True
+    return False
 
 async def is_vip(user_id: int) -> bool:
-    async with db_connection() as db:
-        async with db.execute(
-            "SELECT vip_until FROM users WHERE user_id = ?",
-            (user_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT vip_until FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0] and row[0] > time.time():
+                return True
+    return False
 
-    return bool(row and float(row["vip_until"] or 0) > now_ts())
-
+async def get_user_display_name(user_id: int, clean: bool = False) -> str:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT username FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            if row and row[0]:
+                uname = row[0].lstrip("@")
+                if clean:
+                    return uname
+                return f"@{uname}" if " " not in uname else uname
+    return f"ID:{user_id}"
 
 async def is_admin(user_id: int) -> bool:
     if user_id == SUPER_ADMIN_ID:
         return True
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)) as cur:
+            return bool(await cur.fetchone())
 
-    async with db_connection() as db:
-        async with db.execute(
-            "SELECT 1 FROM admins WHERE user_id = ?",
-            (user_id,),
-        ) as cursor:
-            return await cursor.fetchone() is not None
-
-
-async def get_username_from_db(user_id: int) -> str:
-    async with db_connection() as db:
-        async with db.execute(
-            "SELECT username FROM users WHERE user_id = ?",
-            (user_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-    if not row or not row["username"]:
-        return f"ID:{user_id}"
-
-    return esc(str(row["username"]).lstrip("@"))
-
-
-async def register_chat(message: Message) -> None:
-    if message.chat.type not in {
-        ChatType.GROUP,
-        ChatType.SUPERGROUP,
-    }:
-        return
-
-    timestamp = now_ts()
-
-    async with transaction() as db:
+async def add_log(admin_id: int, action: str):
+    async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
-            """
-            INSERT INTO chats(
-                chat_id,
-                chat_type,
-                inactivity_interval,
-                last_activity
-            )
-            VALUES (?, ?, 3600, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                chat_type = excluded.chat_type,
-                last_activity = excluded.last_activity
-            """,
-            (
-                message.chat.id,
-                message.chat.type,
-                timestamp,
-            ),
+            "INSERT INTO logs (admin_id, action, timestamp) VALUES (?, ?, ?)",
+            (admin_id, action, time.time()),
         )
+        await db.commit()
 
-    chat_activity_memory[message.chat.id] = timestamp
+# ----------------- СЕТЬ -----------------
+class TermuxAiohttpSession(AiohttpSession):
+    async def create_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=False)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                json_serialize=self.json_dumps,
+            )
+        return self._session
 
+session = TermuxAiohttpSession(
+    api=TelegramAPIServer.from_base("https://api.telegram.org"),
+    timeout=90.0
+)
 
-# -------------------------
-# GLOBAL MIDDLEWARE
-# -------------------------
+bot = Bot(
+    token=BOT_TOKEN,
+    session=session,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
+dp = Dispatcher(storage=MemoryStorage())
 
-@router.message.outer_middleware()
-async def message_registration_middleware(handler, event, data):
-    if isinstance(event, Message):
-        try:
-            await register_chat(event)
-        except Exception:
-            logger.exception("Ошибка регистрации чата")
+def get_normalized_command(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    token = text.strip().split()[0].lower()
+    if "@" in token:
+        token = token.split("@")[0]
+    return token
 
+def match_command(message: Message, aliases: List[str]) -> bool:
+    if not message.text:
+        return False
+    norm = get_normalized_command(message.text)
+    full_lower = message.text.strip().lower()
+    for a in aliases:
+        a_low = a.lower()
+        if norm == a_low or full_lower == a_low:
+            return True
+        if norm == f"/{a_low}" or full_lower == f"/{a_low}":
+            return True
+    return False
+
+async def check_channel_subscription(user_id: int) -> tuple[bool, str]:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        status = str(getattr(member, "status", "")).lower()
+        if any(s in status for s in ["creator", "administrator", "member", "restricted"]):
+            return True, "ok"
+        return False, "not_member"
+    except Exception as e:
+        err_msg = str(e).lower()
+        logger.error(f"Subscription check error: {e}")
+        if "chat not found" in err_msg or "bot is not a member" in err_msg or "user not found" in err_msg:
+            return False, "bot_not_admin"
+        return False, "error"
+
+@dp.message.outer_middleware()
+async def register_middleware(handler, event: Message, data: dict):
+    if event.chat:
+        await register_chat(event.chat.id, event.chat.type)
+        if event.chat.type in ["group", "supergroup"]:
+            chat_last_activity[event.chat.id] = time.time()
     return await handler(event, data)
 
+# ----------------- КОМАНДЫ ИГРОКОВ -----------------
 
-# -------------------------
-# GLOBAL ERROR HANDLER
-# -------------------------
+# Реферальная система
+@dp.message(lambda msg: match_command(msg, ["ref", "реф", "рефералы", "рефералка", "пригласить"]))
+async def referral_info_cmd(message: Message):
+    uid = message.from_user.id
+    bot_me = await bot.get_me()
+    ref_link = f"https://t.me/{bot_me.username}?start=ref{uid}"
 
-@dp.error()
-async def global_error_handler(event):
-    logger.exception("Глобальная ошибка обработки события: %r", event)
-    return True
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+            total_refs = row[0] if row else 0
 
-# =========================
-# BLOCK 2/5 — ИГРОКИ
-# =========================
+        async with db.execute("SELECT COUNT(*) FROM users WHERE referred_by = ? AND referral_reward_given = 1", (uid,)) as cur:
+            row2 = await cur.fetchone()
+            completed_refs = row2[0] if row2 else 0
 
-def bonus_keyboard(bot_username: str) -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text="🎁 Забрать бонус",
-                url=f"https://t.me/{bot_username}?start=bonus",
-            )
-        ]
-    ]
+    earned_coins = completed_refs * 25
 
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-async def post_card_keyboard() -> InlineKeyboardMarkup:
-    bot_info = await bot.get_me()
-
-    buttons = [
-        [
-            InlineKeyboardButton(
-                text="🎁 Забрать бонус",
-                url=f"https://t.me/{bot_info.username}?start=bonus",
-            )
-        ]
-    ]
-
-    async with db_connection() as db:
-        async with db.execute(
-            "SELECT value FROM settings WHERE key = 'post_btn_url'"
-        ) as cursor:
-            row = await cursor.fetchone()
-
-    if row and row["value"]:
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text="Присоединиться / Подробнее",
-                    url=row["value"],
-                )
-            ]
-        )
-
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def format_card_caption(
-    card_id: int,
-    rarity: str,
-    description: str,
-    duplicate: bool,
-    compensation: int = 0,
-    prefix: str = "✨ Выпала карта",
-) -> str:
-    result = (
-        f"{prefix} <b>#{card_id}</b>\n\n"
-        f"🏷 <b>Редкость:</b> {esc(rarity)}\n"
-        f"📝 <b>Описание:</b> "
-        f"{esc(description) if description else 'Без описания'}\n"
+    msg1 = (
+        f"🚀 <b>Зарабатывай на приглашении друзей!</b>\n\n"
+        f"Приглашай друзей в бота по своей персональной ссылке! "
+        f"За каждого <b>нового</b> пользователя ты получишь <b>+25 🪙 фемкоинов</b> "
+        f"сразу после того, как он заберет свой первый ежедневный бонус (команда <code>/daily</code>)!\n\n"
+        f"⚠️ <i>Важно: если игрок уже запускал бота ранее или начнет играть до того, как заберет дейлик — бонус не начислится!</i>\n\n"
+        f"🔗 <b>Ваша ссылка для приглашения:</b>\n"
+        f"<code>{ref_link}</code>\n\n"
+        f"📊 <b>Ваша статистика:</b>\n"
+        f"• Перешло новичков: <b>{total_refs}</b>\n"
+        f"• Начислено бонусов: <b>{completed_refs}</b> (+{earned_coins} 🪙)"
     )
 
-    if duplicate:
-        result += "\n🔁 <i>Это дубликат карты.</i>"
-    else:
-        result += "\n🆕 <i>Новая карта в коллекции!</i>"
-
-    if compensation:
-        result += (
-            f"\n💰 VIP-компенсация: "
-            f"<b>+{compensation} 🪙</b>"
-        )
-
-    return result
-
-
-async def choose_card(
-    db: aiosqlite.Connection,
-    weights: dict[str, float],
-) -> Optional[aiosqlite.Row]:
-    available_rarities: list[str] = []
-
-    async with db.execute(
-        "SELECT DISTINCT rarity FROM cards"
-    ) as cursor:
-        rows = await cursor.fetchall()
-
-    existing = {
-        str(row["rarity"])
-        for row in rows
-    }
-
-    for rarity in weights:
-        if rarity in existing:
-            available_rarities.append(rarity)
-
-    if available_rarities:
-        selected_rarity = random.choices(
-            available_rarities,
-            weights=[weights[item] for item in available_rarities],
-            k=1,
-        )[0]
-
-        async with db.execute(
-            """
-            SELECT id, file_id, rarity, description
-            FROM cards
-            WHERE rarity = ?
-            ORDER BY RANDOM()
-            LIMIT 1
-            """,
-            (selected_rarity,),
-        ) as cursor:
-            card = await cursor.fetchone()
-
-        if card:
-            return card
-
-    async with db.execute(
-        """
-        SELECT id, file_id, rarity, description
-        FROM cards
-        ORDER BY RANDOM()
-        LIMIT 1
-        """
-    ) as cursor:
-        return await cursor.fetchone()
-
-
-async def add_card_to_inventory(
-    db: aiosqlite.Connection,
-    user_id: int,
-    card_id: int,
-) -> tuple[bool, int]:
-    async with db.execute(
-        """
-        SELECT count
-        FROM inventory
-        WHERE user_id = ? AND card_id = ?
-        """,
-        (user_id, card_id),
-    ) as cursor:
-        row = await cursor.fetchone()
-
-    if row:
-        await db.execute(
-            """
-            UPDATE inventory
-            SET count = count + 1
-            WHERE user_id = ? AND card_id = ?
-            """,
-            (user_id, card_id),
-        )
-        return True, int(row["count"])
-
-    await db.execute(
-        """
-        INSERT INTO inventory(user_id, card_id, count)
-        VALUES (?, ?, 1)
-        """,
-        (user_id, card_id),
+    msg2 = (
+        f"📢 <b>Зарабатывай на добавлении бота в чаты!</b>\n\n"
+        f"Добавляй нашего бота в свои группы и получай щедрые награды за активность:\n"
+        f"• Группа от 15 участников — <b>+50 🪙</b>\n"
+        f"• Группа от 500 участников — <b>+300 🪙</b>\n"
+        f"• Группа от 2000 участников — <b>+500 🪙</b>\n\n"
+        f"<i>*Бонус выдается владельцу чата. Действует лимит: не более 3 групп на одного владельца во избежание накрутки!</i>"
     )
-    return False, 0
 
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить бота в чат", url=f"https://t.me/{bot_me.username}?startgroup=true")]
+    ])
 
-async def draw_card(
-    user_id: int,
-    *,
-    lucky: bool,
-    vip: bool,
-    force_duplicate: bool = False,
-) -> Optional[dict[str, Any]]:
-    if vip and not force_duplicate:
+    await message.answer(msg1)
+    await message.answer(msg2, reply_markup=kb)
+
+@dp.message(CommandStart())
+async def start_cmd(message: Message):
+    args = message.text.split()
+    ref_id = 0
+    if len(args) > 1 and args[1].startswith("ref"):
+        try:
+            ref_id = int(args[1].replace("ref", ""))
+        except Exception:
+            ref_id = 0
+
+    is_new_user, _ = await get_or_create_user(message.from_user, ref_id)
+
+    if len(args) > 1 and args[1].startswith("ref") and not is_new_user:
+        await message.reply("❌ <b>Отказ:</b> Вы уже взаимодействовали с ботом ранее. Вы не являетесь новым пользователем, поэтому реферальный бонус не будет начислен.")
+
+    if len(args) > 1 and args[1] == "bonus":
+        if message.chat.type != "private":
+            bot_me = await bot.get_me()
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Получить бонус в ЛС", url=f"https://t.me/{bot_me.username}?start=bonus")]])
+            return await message.reply("🎁 Бонус выдается в личных сообщениях с ботом!", reply_markup=kb)
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🩷 ТГК Фембойчик", url=CHANNEL_URL)],
+            [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_channel_sub")]
+        ])
+        return await message.answer(
+            "🎁 <b>Еженедельный бонус и скип КД!</b>\n\n"
+            "Подпишитесь на наш Telegram-канал, чтобы получить:\n"
+            "• Мгновенный сброс кулдауна попыток!\n"
+            "• <b>+50 🪙 фемкоинов</b> сразу и каждую неделю пока вы подписаны!",
+            reply_markup=kb
+        )
+
+    if len(args) > 1 and args[1] == "shop":
+        return await shop_command(message)
+
+    await message.reply(
+        "👋 Привет! Я игровой бот.\n"
+        "Напиши <b>фем</b> или /foto, чтобы крутить карточки.\n\n"
+        "👥 Напиши команду <b>реф</b>, чтобы получить реферальную ссылку и узнать, как зарабатывать монеты на друзьях и чатах!"
+    )
+
+async def process_single_card_draw(uid: int, is_lucky: bool, is_vip_user: bool, is_second_card: bool = False):
+    if is_vip_user and not is_second_card:
         weights = VIP_WEIGHTS
-    elif lucky:
+    elif is_lucky:
         weights = LUCK_WEIGHTS
     else:
         weights = BASE_WEIGHTS
 
-    async with transaction() as db:
-        card = await choose_card(db, weights)
+    chosen_rarity = random.choices(list(weights.keys()), weights=list(weights.values()))[0]
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, file_id, description FROM cards WHERE rarity = ? ORDER BY RANDOM() LIMIT 1", (chosen_rarity,)) as cur:
+            card = await cur.fetchone()
 
         if not card:
-            return None
+            async with db.execute("SELECT id, file_id, description, rarity FROM cards ORDER BY RANDOM() LIMIT 1") as cur:
+                card = await cur.fetchone()
+                if not card:
+                    return None, None, False
+                chosen_rarity = card[3]
 
-        if force_duplicate:
-            async with db.execute(
-                """
-                SELECT c.id, c.file_id, c.rarity, c.description
-                FROM inventory AS i
-                JOIN cards AS c ON c.id = i.card_id
-                WHERE i.user_id = ?
-                ORDER BY RANDOM()
-                LIMIT 1
-                """,
-                (user_id,),
-            ) as cursor:
-                duplicate_card = await cursor.fetchone()
+        c_id, f_id, desc = card[0], card[1], card[2]
 
-            if duplicate_card:
-                card = duplicate_card
+        async with db.execute("SELECT id, count FROM inventory WHERE user_id = ? AND card_id = ?", (uid, c_id)) as cur:
+            inv_row = await cur.fetchone()
+            compensation = 0
+            if inv_row:
+                inv_id, current_count = inv_row
+                await db.execute("UPDATE inventory SET count = count + 1 WHERE id = ?", (inv_id,))
+                is_dup = True
+                if is_vip_user:
+                    compensation = DUP_COMPENSATION.get(chosen_rarity, 5)
+                    await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (compensation, uid))
+            else:
+                if is_second_card:
+                    async with db.execute("SELECT c.id, c.file_id, c.rarity, c.description, inv.id FROM inventory inv JOIN cards c ON inv.card_id = c.id WHERE inv.user_id = ? ORDER BY RANDOM() LIMIT 1", (uid,)) as fallback_cur:
+                        fb_card = await fallback_cur.fetchone()
+                        if fb_card:
+                            c_id, f_id, chosen_rarity, desc, inv_id = fb_card[0], fb_card[1], fb_card[2], fb_card[3], fb_card[4]
+                            await db.execute("UPDATE inventory SET count = count + 1 WHERE id = ?", (inv_id,))
+                            is_dup = True
+                            if is_vip_user:
+                                compensation = DUP_COMPENSATION.get(chosen_rarity, 5)
+                                await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (compensation, uid))
+                        else:
+                            await db.execute("INSERT INTO inventory (user_id, card_id, count) VALUES (?, ?, 1)", (uid, c_id))
+                            is_dup = False
+                else:
+                    await db.execute("INSERT INTO inventory (user_id, card_id, count) VALUES (?, ?, 1)", (uid, c_id))
+                    is_dup = False
 
-        card_id = int(card["id"])
-        rarity = str(card["rarity"])
+        await db.commit()
+    return (c_id, f_id, chosen_rarity, desc), is_dup, compensation
 
-        duplicate, old_count = await add_card_to_inventory(
-            db,
-            user_id,
-            card_id,
-        )
+@dp.message(lambda msg: match_command(msg, ["foto", "fem", "фем"]))
+async def fem_command(message: Message):
+    uid = message.from_user.id
+    now = time.time()
+    await get_or_create_user(message.from_user)
+    await disqualify_referral(uid)
 
-        compensation = 0
+    vip_active = await is_vip(uid)
 
-        if duplicate and vip:
-            compensation = DUPLICATE_COMPENSATION.get(rarity, 5)
+    async with aiosqlite.connect(DB_NAME) as db:
+        try:
+            async with db.execute("SELECT channel_bonus_claimed, last_weekly_bonus FROM users WHERE user_id = ?", (uid,)) as cur:
+                b_row = await cur.fetchone()
+                if b_row and (b_row[0] or 0) > 0:
+                    last_weekly = b_row[1] or 0
+                    if now - last_weekly >= 604800:
+                        is_sub, _ = await check_channel_subscription(uid)
+                        if is_sub:
+                            await db.execute("UPDATE users SET femcoins = femcoins + 50, last_weekly_bonus = ? WHERE user_id = ?", (now, uid))
+                            await db.commit()
+                            try:
+                                await bot.send_message(uid, "🎁 <b>Еженедельный бонус!</b>\nВам начислено <b>+50 🪙 фемкоинов</b> за подписку на ТГК!")
+                            except Exception:
+                                pass
+                        else:
+                            await db.execute("UPDATE users SET channel_bonus_claimed = 0 WHERE user_id = ?", (uid,))
+                            await db.commit()
+        except Exception as e:
+            logger.warning(f"Weekly bonus check exception: {e}")
 
-            await db.execute(
-                """
-                UPDATE users
-                SET femcoins = femcoins + ?
-                WHERE user_id = ?
-                """,
-                (compensation, user_id),
-            )
-
-        return {
-            "id": card_id,
-            "file_id": card["file_id"],
-            "rarity": rarity,
-            "description": card["description"] or "",
-            "duplicate": duplicate,
-            "compensation": compensation,
-            "old_count": old_count,
-        }
-
-
-async def get_effective_fem_cooldown(
-    db: aiosqlite.Connection,
-    user_id: int,
-    current_time: float,
-) -> float:
-    async with db.execute(
-        """
-        SELECT custom_cd_hours, custom_cd_expires, vip_until
-        FROM users
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    ) as cursor:
-        row = await cursor.fetchone()
-
-    if not row:
-        return 3 * 3600
-
-    custom_hours = float(row["custom_cd_hours"] or 3)
-    custom_expires = float(row["custom_cd_expires"] or 0)
-    vip_until = float(row["vip_until"] or 0)
-
-    if custom_expires == -1 or custom_expires > current_time:
-        return max(0, custom_hours * 3600)
-
-    if vip_until > current_time:
-        return 2 * 3600
-
-    return 3 * 3600
-
-
-async def check_attack_block(
-    user_id: int,
-    current_time: float,
-) -> float:
-    async with db_connection() as db:
         async with db.execute(
-            """
-            SELECT attack_block_until
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-    if not row:
-        return 0
-
-    return max(0, float(row["attack_block_until"] or 0) - current_time)
-
-
-async def process_referral_reward(
-    new_user_id: int,
-) -> Optional[int]:
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT referred_by, referral_reward_given
-            FROM users
-            WHERE user_id = ?
-            """,
-            (new_user_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+            "SELECT last_fem_time, custom_cd_hours, custom_cd_expires, cd_resets_count, cd_reset_expires, luck_expires FROM users WHERE user_id = ?",
+            (uid,)
+        ) as cur:
+            row = await cur.fetchone()
 
         if not row:
-            return None
+            last_fem, custom_cd, custom_exp, cd_resets, reset_exp, luck_exp = 0, 3.0, 0, 0, 0, 0
+        else:
+            last_fem, custom_cd, custom_exp, cd_resets, reset_exp, luck_exp = row
 
-        referrer_id = int(row["referred_by"] or 0)
-        reward_given = int(row["referral_reward_given"] or 0)
+        effective_cd = 2.0 if vip_active else 3.0
+        if custom_exp == -1 or custom_exp > now:
+            effective_cd = custom_cd
 
-        if referrer_id <= 0 or referrer_id == new_user_id:
-            return None
+        cd_seconds = effective_cd * 3600
+        time_passed = now - last_fem
 
-        if reward_given != 0:
-            return None
+        if time_passed < cd_seconds:
+            if cd_resets > 0 and (reset_exp == 0 or reset_exp > now):
+                await db.execute("UPDATE users SET cd_resets_count = cd_resets_count - 1 WHERE user_id = ?", (uid,))
+                if cd_resets - 1 <= 0:
+                    await db.execute("UPDATE users SET cd_reset_expires = 0 WHERE user_id = ?", (uid,))
+                await db.commit()
+                await message.reply("🔄 Использован накопленный сброс ожидания! Крутим фото...")
+            else:
+                if cd_resets > 0 and reset_exp <= now:
+                    await db.execute("UPDATE users SET cd_resets_count = 0, cd_reset_expires = 0 WHERE user_id = ?", (uid,))
+                    await db.commit()
+                rem = cd_seconds - time_passed
+                h = int(rem // 3600)
+                m = int((rem % 3600) // 60)
+                s = int(rem % 60)
+                return await message.reply(f"⏳ Рано! До следующей попытки осталось: {h}ч {m}м {s}с.")
 
-        async with db.execute(
-            "SELECT 1 FROM users WHERE user_id = ?",
-            (referrer_id,),
-        ) as cursor:
-            referrer_exists = await cursor.fetchone()
+        is_lucky = luck_exp > now
 
-        if not referrer_exists:
-            await db.execute(
-                """
-                UPDATE users
-                SET referral_reward_given = 2
-                WHERE user_id = ?
-                """,
-                (new_user_id,),
-            )
-            return None
+        card_data1, is_dup1, comp1 = await process_single_card_draw(uid, is_lucky, vip_active, is_second_card=False)
+        if not card_data1:
+            return await message.reply("😔 Карты ещё не добавлены администраторами. Подождите немного!")
 
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins + 25
-            WHERE user_id = ?
-            """,
-            (referrer_id,),
-        )
+        c_id1, f_id1, rarity1, desc1 = card_data1
 
-        await db.execute(
-            """
-            UPDATE users
-            SET referral_reward_given = 1
-            WHERE user_id = ?
-            """,
-            (new_user_id,),
-        )
+        await db.execute("UPDATE users SET last_fem_time = ? WHERE user_id = ?", (now, uid))
+        await db.commit()
 
-        return referrer_id
+    caption1 = (
+        f"✨ <b>Вам выпала карта #{c_id1}!</b>\n\n"
+        f"🏷 <b>Редкость:</b> {rarity1}\n"
+        f"📝 <b>Описание:</b> {desc1 or 'Без описания'}\n"
+        f"{'<i>(Это дубликат! Пойдет на крафт или обмен)</i>' if is_dup1 else '🆕 <i>Новая карта в коллекции!</i>'}"
+        f"{f'\n💰 VIP компенсация: +{comp1} 🪙' if comp1 > 0 else ''}"
+    )
 
-
-async def get_profile_text(
-    user_id: int,
-) -> tuple[str, InlineKeyboardMarkup]:
-    current_time = now_ts()
-
-    async with db_connection() as db:
-        async with db.execute(
-            """
-            SELECT femcoins, vip_until,
-                   cd_resets_count, cd_reset_expires,
-                   attack_block_until
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            user = await cursor.fetchone()
-
-        if not user:
-            return (
-                "Профиль ещё не создан.",
-                InlineKeyboardMarkup(inline_keyboard=[]),
-            )
-
-        async with db.execute(
-            """
-            SELECT COUNT(DISTINCT card_id) AS unique_cards,
-                   COALESCE(SUM(count), 0) AS total_cards
-            FROM inventory
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            cards = await cursor.fetchone()
-
-        async with db.execute(
-            "SELECT COUNT(*) AS total FROM cards"
-        ) as cursor:
-            card_total = await cursor.fetchone()
-
-        async with db.execute(
-            """
-            SELECT artifact_type, subtype,
-                   SUM(amount) AS amount,
-                   SUM(hidden_amount) AS hidden_amount
-            FROM artifacts
-            WHERE user_id = ?
-            GROUP BY artifact_type, subtype
-            """,
-            (user_id,),
-        ) as cursor:
-            artifact_rows = await cursor.fetchall()
-
-    lines = [
-        "👤 <b>Профиль игрока</b>",
-        "",
-        f"💰 Баланс: <b>{int(user['femcoins'] or 0)} 🪙</b>",
+    bot_me = await bot.get_me()
+    kb_buttons = [
+        [InlineKeyboardButton(text="🎁 Забрать бонус", url=f"https://t.me/{bot_me.username}?start=bonus")]
     ]
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT value FROM settings WHERE key = 'post_btn_url'") as cur:
+            btn_row = await cur.fetchone()
+            if btn_row and btn_row[0]:
+                kb_buttons.append([InlineKeyboardButton(text="Присоединиться / Подробнее", url=btn_row[0])])
 
-    vip_until = float(user["vip_until"] or 0)
+    await message.answer_photo(photo=f_id1, caption=caption1, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
 
-    if vip_until > current_time:
-        lines.append(
-            f"👑 VIP до: <b>{esc(format_date(vip_until))}</b>"
-        )
-
-    unique_cards = int(cards["unique_cards"] or 0)
-    total_cards = int(cards["total_cards"] or 0)
-    available_cards = int(card_total["total"] or 0)
-
-    if unique_cards:
-        lines.append(
-            f"🎴 Собранные карты: "
-            f"<b>{unique_cards}/{available_cards}</b> "
-            f"(копий: {total_cards})"
-        )
-
-    skip_count = int(user["cd_resets_count"] or 0)
-    skip_expires = float(user["cd_reset_expires"] or 0)
-
-    if skip_count > 0 and skip_expires > current_time:
-        lines.append(
-            f"⚡ Скипы: <b>{skip_count}</b> "
-            f"(осталось {short_time(skip_expires - current_time)})"
-        )
-
-    blades = 0
-    armor = 0
-    shields: dict[str, int] = {}
-
-    for row in artifact_rows:
-        artifact_type = str(row["artifact_type"])
-        subtype = str(row["subtype"] or "")
-        amount = int(row["amount"] or 0)
-
-        if amount <= 0:
-            continue
-
-        if artifact_type == "blade":
-            blades += amount
-        elif artifact_type == "armor":
-            armor += amount
-        elif artifact_type == "shield":
-            shields[subtype] = shields.get(subtype, 0) + amount
-
-    if blades:
-        lines.append(f"🗡 Открытые клинки: <b>{blades}</b>")
-
-    if armor:
-        lines.append(f"🛡 Открытая броня: <b>{armor}</b>")
-
-    shield_names = {
-        "weak": "слабых",
-        "reinforced": "усиленных",
-        "femboy": "фембойских",
-    }
-
-    shield_lines = []
-
-    for subtype, amount in shields.items():
-        if amount > 0:
-            shield_lines.append(
-                f"{shield_names.get(subtype, subtype)}: {amount}"
+    if vip_active and random.random() < 0.20:
+        await asyncio.sleep(0.6)
+        card_data2, is_dup2, comp2 = await process_single_card_draw(uid, is_lucky, vip_active, is_second_card=True)
+        if card_data2:
+            c_id2, f_id2, rarity2, desc2 = card_data2
+            caption2 = (
+                f"👑 <b>VIP-Бонус: Вторая карта!</b> (# {c_id2})\n\n"
+                f"🏷 <b>Редкость:</b> {rarity2}\n"
+                f"📝 <b>Описание:</b> {desc2 or 'Без описания'}\n"
+                f"🔁 <i>(Гарантированный дубликат)</i>\n"
+                f"💰 VIP компенсация: +{comp2 or 5} 🪙"
             )
+            await message.answer_photo(photo=f_id2, caption=caption2)
 
-    if shield_lines:
-        lines.append(
-            "🔰 Открытые щиты: <b>"
-            + ", ".join(shield_lines)
-            + "</b>"
+    if message.chat.type in ["group", "supergroup"] and random.random() < 0.10:
+        await asyncio.sleep(0.8)
+        chest_id = f"ch_{int(time.time() * 1000)}_{random.randint(100, 999)}"
+        reward_coins = random.choices([15, 25, 40, 60, 90], weights=[50, 25, 15, 7, 3])[0]
+        active_chests[chest_id] = {
+            "type": "normal",
+            "coins": reward_coins,
+            "claimed": False,
+            "winner_name": None
+        }
+
+        chest_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎁 Забрать сундук!", callback_data=f"claim_chest_{chest_id}")]
+        ])
+        await message.answer(
+            "📦 <b>Рядом упал тайный фем-сундук!</b>\n"
+            "<i>Кто первым нажмет на кнопку ниже, заберет все фемкоины себе!</i>",
+            reply_markup=chest_kb
         )
 
-    attack_block_until = float(
-        user["attack_block_until"] or 0
+@dp.callback_query(F.data.startswith("claim_chest_"))
+async def open_chest_handler(callback: CallbackQuery):
+    chest_id = callback.data.replace("claim_chest_", "")
+    chest = active_chests.get(chest_id)
+
+    if not chest:
+        return await callback.answer("Сундук уже исчез или был забран!", show_alert=True)
+
+    if chest["claimed"]:
+        return await callback.answer(f"Сундук уже забрал {chest['winner_name']}!", show_alert=True)
+
+    chest["claimed"] = True
+    uid = callback.from_user.id
+    u_name = callback.from_user.username or callback.from_user.full_name
+    chest["winner_name"] = u_name
+
+    c_type = chest.get("type", "normal")
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        if c_type == "legendary":
+            coins = 250
+            await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (coins, uid))
+            
+            async with db.execute("SELECT id, file_id, rarity FROM cards WHERE rarity = 'Легендарное' ORDER BY RANDOM() LIMIT 1") as cur:
+                l_card = await cur.fetchone()
+            if not l_card:
+                async with db.execute("SELECT id, file_id, rarity FROM cards ORDER BY RANDOM() LIMIT 1") as cur:
+                    l_card = await cur.fetchone()
+
+            card_text = ""
+            if l_card:
+                c_id, f_id, rarity = l_card
+                async with db.execute("SELECT id FROM inventory WHERE user_id = ? AND card_id = ?", (uid, c_id)) as cur:
+                    inv_exists = await cur.fetchone()
+                    if inv_exists:
+                        await db.execute("UPDATE inventory SET count = count + 1 WHERE id = ?", (inv_exists[0],))
+                    else:
+                        await db.execute("INSERT INTO inventory (user_id, card_id, count) VALUES (?, ?, 1)", (uid, c_id))
+                card_text = f"\n🎴 <b>Легендарная награда:</b> Карта #{c_id} ({rarity})!"
+
+            await db.commit()
+            await callback.message.edit_text(
+                f"🌟🌟🌟 <b>ЛЕГЕНДАРНЫЙ СУНДУК ОТКРЫТ!</b> 🌟🌟🌟\n\n"
+                f"⚡ Счастливчик: <b>{u_name}</b>\n"
+                f"💰 Награда: <b>+{coins} 🪙 фемкоинов</b>{card_text}"
+            )
+            return await callback.answer("Легендарный сундук ваш!")
+
+        elif c_type == "rare":
+            coins = chest["coins"]
+            await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (coins, uid))
+            await db.commit()
+            await callback.message.edit_text(
+                f"✨ <b>Редкий сундук открыт!</b>\n\n"
+                f"⚡ Успел забрать: <b>{u_name}</b>\n"
+                f"💎 Награда: <b>+{coins} 🪙 фемкоинов</b>!"
+            )
+            return await callback.answer(f"+{coins} фемкоинов!")
+
+        else:
+            coins = chest["coins"]
+            await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (coins, uid))
+            await db.commit()
+            await callback.message.edit_text(
+                f"🎉 <b>Сундук открыт!</b>\n\n"
+                f"⚡ Самым быстрым оказался: <b>{u_name}</b>\n"
+                f"💰 Награда: <b>+{coins} 🪙 фемкоинов</b> зачислена на баланс!"
+            )
+            return await callback.answer(f"Поздравляем! +{coins} фемкоинов ваши!")
+
+@dp.message(lambda msg: msg.text and any(
+    msg.text.lower().strip().startswith(cmd) for cmd in ["золотой дождь", "/golden_rain", "golden_rain", "золотой_дождь", "/золотой_дождь"]
+))
+async def golden_rain_cmd(message: Message):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+
+    if message.chat.type not in ["group", "supergroup"]:
+        return await message.reply("❌ Золотой дождь можно запускать только в группах!")
+
+    parts = message.text.strip().split()
+    chests_count = 10
+    interval = 3.0
+
+    if len(parts) > 1 and parts[1].isdigit():
+        chests_count = max(1, min(50, int(parts[1])))
+    if len(parts) > 2 and parts[2].replace('.', '', 1).isdigit():
+        interval = max(1.0, float(parts[2]))
+
+    leg_count = 0
+    if chests_count >= 50:
+        leg_count = 2
+    elif chests_count >= 10:
+        leg_count = 1
+
+    await message.reply(
+        f"🌧🌟 <b>Начинается ЗОЛОТОЙ ДОЖДЬ!</b> 🌟🌧\n"
+        f"В чате появится <b>{chests_count} сундуков</b>!\n"
+        f"Легендарных сундуков в этом дожде: <b>{leg_count}</b>. Ловите!"
     )
 
-    if attack_block_until > current_time:
-        lines.append(
-            "🚫 Запрет сбора карт: "
-            f"<b>{short_time(attack_block_until - current_time)}</b>"
-        )
+    leg_indices = random.sample(range(1, chests_count + 1), leg_count) if leg_count > 0 else []
+    asyncio.create_task(run_golden_rain_process(message.chat.id, chests_count, leg_indices, interval))
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎴 Мои карты",
-                    callback_data=f"profile_cards:{user_id}:0",
+async def run_golden_rain_process(chat_id: int, total: int, leg_indices: List[int], interval: float):
+    for i in range(1, total + 1):
+        await asyncio.sleep(interval)
+        chest_id = f"gr_{chat_id}_{int(time.time() * 1000)}_{random.randint(100, 999)}"
+
+        if i in leg_indices:
+            active_chests[chest_id] = {
+                "type": "legendary",
+                "claimed": False,
+                "winner_name": None
+            }
+            chest_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🌟 ПОЙМАТЬ ЛЕГЕНДАРНЫЙ СУНДУК!", callback_data=f"claim_chest_{chest_id}")]
+            ])
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"👑 <b>С небес упал сияющий ЛЕГЕНДАРНЫЙ СУНДУК!</b> (Дождь: {i}/{total})\n"
+                    f"<i>Внутри 250 фемкоинов и легендарная карта! Жми скорее!</i>",
+                    reply_markup=chest_kb
                 )
-            ]
-        ]
-    )
+            except Exception:
+                pass
+        elif random.random() < 0.25:
+            rare_coins = random.randint(50, 100)
+            active_chests[chest_id] = {
+                "type": "rare",
+                "coins": rare_coins,
+                "claimed": False,
+                "winner_name": None
+            }
+            chest_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💎 Забрать редкий сундук!", callback_data=f"claim_chest_{chest_id}")]
+            ])
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"💎 <b>Промелькнул Редкий сундук!</b> (Дождь: {i}/{total})\n"
+                    f"<i>+{rare_coins} фемкоинов внутри!</i>",
+                    reply_markup=chest_kb
+                )
+            except Exception:
+                pass
+        else:
+            norm_coins = random.randint(3, 15)
+            active_chests[chest_id] = {
+                "type": "normal",
+                "coins": norm_coins,
+                "claimed": False,
+                "winner_name": None
+            }
+            chest_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎁 Забрать сундук!", callback_data=f"claim_chest_{chest_id}")]
+            ])
+            try:
+                await bot.send_message(
+                    chat_id,
+                    f"📦 <b>Упал сундук с золотого дождя!</b> (Дождь: {i}/{total})\n"
+                    f"<i>Хватай скорее!</i>",
+                    reply_markup=chest_kb
+                )
+            except Exception:
+                pass
 
-    return "\n".join(lines), keyboard
-@router.message(
-    lambda message: command_is(
-        message,
-        "профиль",
-        "profile",
-        "profil",
-    )
-)
-async def profile_command(message: Message) -> None:
-    await ensure_user(message.from_user)
-
-    text, keyboard = await get_profile_text(
-        message.from_user.id,
-    )
-
-    await message.answer(
-        text,
-        reply_markup=keyboard,
-    )
-
-
-@router.callback_query(F.data.startswith("profile_cards:"))
-async def profile_cards_callback(
-    callback: CallbackQuery,
-) -> None:
-    payload = parse_callback(
-        callback.data or "",
-        "profile_cards:",
-    )
-
-    if not payload:
-        await safe_callback_answer(
-            callback,
-            "Некорректная кнопка",
-            show_alert=True,
-        )
+@dp.my_chat_member()
+async def bot_added_removed_handler(event: types.ChatMemberUpdated):
+    chat = event.chat
+    if chat.type not in ["group", "supergroup"]:
         return
 
-    try:
-        owner_raw, index_raw = payload.rsplit(":", 1)
-        owner_id = int(owner_raw)
-        index = int(index_raw)
-    except (ValueError, TypeError):
-        await safe_callback_answer(
-            callback,
-            "Некорректные данные",
-            show_alert=True,
-        )
-        return
+    new_status = event.new_chat_member.status
+    old_status = event.old_chat_member.status
 
-    if callback.from_user.id != owner_id:
-        await safe_callback_answer(
-            callback,
-            "Это не ваш профиль",
-            show_alert=True,
-        )
-        return
+    if new_status in ["member", "administrator"] and old_status in ["left", "kicked"]:
+        chat_id = chat.id
+        creator_id = 0
 
-    async with db_connection() as db:
-        async with db.execute(
-            """
-            SELECT c.id, c.file_id, c.rarity,
-                   c.description, i.count
-            FROM inventory AS i
-            JOIN cards AS c ON c.id = i.card_id
-            WHERE i.user_id = ?
-            """,
-            (owner_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        try:
+            admins = await bot.get_chat_administrators(chat_id)
+            for adm in admins:
+                if adm.status == "creator":
+                    creator_id = adm.user.id
+                    break
+        except Exception as e:
+            logger.error(f"Error fetching chat admins: {e}")
 
-    if not rows:
-        await safe_callback_answer(
-            callback,
-            "У вас пока нет карт",
-            show_alert=True,
-        )
-        return
+        if not creator_id:
+            creator_id = event.from_user.id if event.from_user else 0
 
-    rows = sorted(
-        rows,
-        key=lambda row: (
-            RARITY_ORDER.get(str(row["rarity"]), -1),
-            int(row["id"]),
-        ),
-        reverse=True,
-    )
-
-    index = max(0, min(index, len(rows) - 1))
-    card = rows[index]
-
-    navigation: list[InlineKeyboardButton] = []
-
-    if index > 0:
-        navigation.append(
-            InlineKeyboardButton(
-                text="⬅️ Назад",
-                callback_data=(
-                    f"profile_cards:{owner_id}:{index - 1}"
-                ),
-            )
-        )
-
-    if index < len(rows) - 1:
-        navigation.append(
-            InlineKeyboardButton(
-                text="Вперёд ➡️",
-                callback_data=(
-                    f"profile_cards:{owner_id}:{index + 1}"
-                ),
-            )
-        )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[navigation] if navigation else []
-    )
-
-    caption = (
-        f"🎴 <b>Карта #{int(card['id'])}</b>\n"
-        f"📚 {index + 1}/{len(rows)}\n\n"
-        f"🏷 <b>Редкость:</b> {esc(card['rarity'])}\n"
-        f"🔢 Количество: <b>{int(card['count'])}</b>\n"
-        f"📝 <b>Описание:</b> "
-        f"{esc(card['description']) if card['description'] else 'Без описания'}"
-    )
-
-    try:
-        if callback.message and callback.message.photo:
-            await callback.message.edit_media(
-                InputMediaPhoto(
-                    media=card["file_id"],
-                    caption=caption,
-                ),
-                reply_markup=keyboard,
-            )
-        elif callback.message:
-            await callback.message.delete()
-            await callback.message.answer_photo(
-                card["file_id"],
-                caption=caption,
-                reply_markup=keyboard,
-            )
-    except Exception:
-        logger.exception("Ошибка просмотра коллекции")
-
-    await safe_callback_answer(callback)
-
-
-@router.message(
-    lambda message: command_is(
-        message,
-        "дейлик",
-        "daily",
-    )
-)
-async def daily_command(message: Message) -> None:
-    await ensure_user(message.from_user)
-
-    user_id = message.from_user.id
-    current_time = now_ts()
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT daily_streak, last_daily_time, vip_until
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            user = await cursor.fetchone()
-
-        vip = float(user["vip_until"] or 0) > current_time
-        interval = (
-            DAILY_REWARDS["vip_hours"] if vip else
-            DAILY_REWARDS["normal_hours"]
-        ) * 3600
-
-        last_daily = float(user["last_daily_time"] or 0)
-        elapsed = current_time - last_daily
-
-        if last_daily and elapsed < interval:
-            await message.answer(
-                "⏳ Дейлик уже получен.\n"
-                f"Следующая награда через "
-                f"<b>{short_time(interval - elapsed)}</b>."
-            )
+        if not creator_id:
             return
 
-        streak = int(user["daily_streak"] or 0)
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT reward_claimed FROM group_rewards WHERE chat_id = ?", (chat_id,)) as cur:
+                g_row = await cur.fetchone()
+                if g_row and g_row[0] == 1:
+                    return
 
-        if last_daily and elapsed <= interval + 86400:
+            try:
+                member_count = await bot.get_chat_member_count(chat_id)
+            except Exception:
+                member_count = 15
+
+            if member_count < 15:
+                return
+
+            async with db.execute("SELECT count FROM owner_group_counts WHERE owner_id = ?", (creator_id,)) as cur:
+                o_row = await cur.fetchone()
+                owner_chats_count = o_row[0] if o_row else 0
+
+            if owner_chats_count >= 3:
+                await db.execute("INSERT OR REPLACE INTO group_rewards (chat_id, owner_id, reward_claimed) VALUES (?, ?, 1)", (chat_id, creator_id))
+                await db.commit()
+                return
+
+            if member_count >= 2000:
+                reward = 500
+                tier_desc = "крупная группа (2000+ участников)"
+            elif member_count >= 500:
+                reward = 300
+                tier_desc = "активная группа (500+ участников)"
+            else:
+                reward = 50
+                tier_desc = "стандартная группа (15+ участников)"
+
+            await get_or_create_user(types.User(id=creator_id, is_bot=False, first_name="Owner"))
+            await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (reward, creator_id))
+            await db.execute("INSERT OR REPLACE INTO group_rewards (chat_id, owner_id, reward_claimed) VALUES (?, ?, 1)", (chat_id, creator_id))
+            await db.execute("INSERT OR REPLACE INTO owner_group_counts (owner_id, count) VALUES (?, ?)", (creator_id, owner_chats_count + 1))
+            await db.commit()
+
+        owner_name = await get_user_display_name(creator_id, clean=True)
+        try:
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🩷 ТГК Фембойчик", url=CHANNEL_URL)]
+            ])
+            await bot.send_message(
+                chat_id,
+                f"🎉 <b>Спасибо за добавление бота! ({tier_desc})</b>\n\n"
+                f"👑 Создатель чата <b>{owner_name}</b> получает награду за развитие комьюнити: <b>+{reward} 🪙 фемкоинов</b>!\n"
+                f"<i>(Успешно активировано {owner_chats_count + 1}/3 групп от данного создателя).</i>",
+                reply_markup=kb
+            )
+        except Exception:
+            pass
+
+@dp.message(lambda msg: match_command(msg, ["daily", "дейлик"]))
+async def daily_command(message: Message):
+    uid = message.from_user.id
+    now = time.time()
+    await get_or_create_user(message.from_user)
+    vip_active = await is_vip(uid)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT daily_streak, last_daily_time, referred_by, referral_reward_given FROM users WHERE user_id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+            streak, last_time = row[0] or 0, row[1] or 0
+            referred_by = row[2] or 0
+            ref_reward_given = row[3] or 0
+
+        cd_duration = (22 if vip_active else 24) * 3600
+        diff = now - last_time
+        if diff < cd_duration:
+            rem = cd_duration - diff
+            h, m = int(rem // 3600), int((rem % 3600) // 60)
+            return await message.reply(f"⏳ Вы уже забрали дейлик! Приходите через {h}ч {m}м.")
+
+        if diff <= cd_duration + 86400:
             streak += 1
         else:
             streak = 1
 
-        streak = min(
-            streak,
-            DAILY_REWARDS["maximum_streak"],
-        )
+        streak = min(streak, 30)
+        base_reward = 20 + (streak * 10)
+        vip_bonus = 5 if vip_active else 0
+        reward = base_reward + vip_bonus
 
-        reward = 20 + 10 * streak
-
-        if vip:
-            reward += 5
-
-        await db.execute(
-            """
-            UPDATE users
-            SET daily_streak = ?,
-                last_daily_time = ?,
-                femcoins = femcoins + ?
+        await db.execute("""
+            UPDATE users 
+            SET daily_streak = ?, last_daily_time = ?, femcoins = femcoins + ? 
             WHERE user_id = ?
-            """,
-            (
-                streak,
-                current_time,
-                reward,
-                user_id,
-            ),
-        )
-
-    referrer_id = await process_referral_reward(user_id)
-
-    if referrer_id:
-        try:
-            await bot.send_message(
-                referrer_id,
-                "👥 <b>Реферальный бонус!</b>\n"
-                f"Игрок <b>{display_name(message.from_user)}</b> "
-                "перешёл по вашей ссылке.\n"
-                "Вам начислено <b>+25 🪙</b>.",
-            )
-        except Exception:
-            logger.exception("Не удалось уведомить реферера")
-
-    await message.answer(
-        "📅 <b>Ежедневная награда получена!</b>\n\n"
-        f"🔥 Серия: <b>{streak} дн.</b>\n"
-        f"💰 Награда: <b>+{reward} 🪙</b>"
-        + ("\n👑 VIP-бонус: +5 🪙" if vip else ""),
-    )
-
-
-@router.message(
-    lambda message: command_is(
-        message,
-        "реф",
-        "ref",
-        "рефералы",
-        "рефералка",
-        "пригласить",
-    )
-)
-async def referral_command(message: Message) -> None:
-    await ensure_user(message.from_user)
-
-    bot_info = await bot.get_me()
-    link = (
-        f"https://t.me/{bot_info.username}"
-        f"?start=ref{message.from_user.id}"
-    )
-
-    async with db_connection() as db:
-        async with db.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM users
-            WHERE referred_by = ?
-            """,
-            (message.from_user.id,),
-        ) as cursor:
-            total = await cursor.fetchone()
-
-        async with db.execute(
-            """
-            SELECT COUNT(*) AS completed
-            FROM users
-            WHERE referred_by = ?
-              AND referral_reward_given = 1
-            """,
-            (message.from_user.id,),
-        ) as cursor:
-            completed = await cursor.fetchone()
-
-    total_refs = int(total["total"] or 0)
-    completed_refs = int(completed["completed"] or 0)
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="➕ Добавить бота в группу",
-                    url=(
-                        f"https://t.me/{bot_info.username}"
-                        "?startgroup=true"
-                    ),
-                )
-            ]
-        ]
-    )
-
-    await message.answer(
-        "👥 <b>Реферальная система</b>\n\n"
-        "Приглашайте друзей по ссылке ниже.\n"
-        "За каждого нового пользователя начисляется "
-        "<b>+25 🪙</b> сразу после корректного перехода.\n\n"
-        f"🔗 <code>{esc(link)}</code>\n\n"
-        f"📊 Перешло пользователей: <b>{total_refs}</b>\n"
-        f"✅ Начислено бонусов: <b>{completed_refs}</b>\n"
-        f"💰 Всего заработано: <b>{completed_refs * 25} 🪙</b>",
-        reply_markup=keyboard,
-    )
-
-
-@router.message(CommandStart())
-async def start_command(
-    message: Message,
-    command: CommandObject,
-) -> None:
-    argument = (command.args or "").strip()
-    referrer_id = 0
-
-    if argument.lower().startswith("ref"):
-        try:
-            referrer_id = int(argument[3:])
-        except ValueError:
-            referrer_id = 0
-
-    is_new = await ensure_user(
-        message.from_user,
-        referrer_id,
-    )
-
-    if argument.lower() == "bonus":
-        if message.chat.type != ChatType.PRIVATE:
-            bot_info = await bot.get_me()
-
-            keyboard = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="🎁 Получить бонус в ЛС",
-                            url=(
-                                f"https://t.me/{bot_info.username}"
-                                "?start=bonus"
-                            ),
-                        )
-                    ]
-                ]
-            )
-
-            await message.answer(
-                "🎁 Бонус можно получить только в личных сообщениях.",
-                reply_markup=keyboard,
-            )
-            return
-
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🩷 Канал",
-                        url=CHANNEL_URL,
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="✅ Проверить подписку",
-                        callback_data="bonus_check",
-                    )
-                ],
-            ]
-        )
-
-        await message.answer(
-            "🎁 <b>Бонус за подписку</b>\n\n"
-            f"Подпишитесь на канал {esc(CHANNEL_USERNAME)}, "
-            "затем нажмите кнопку проверки.",
-            reply_markup=keyboard,
-        )
-        return
-
-    if argument.lower() == "shop":
-        await message.answer(
-            "🏪 Магазин будет доступен в следующем разделе.",
-        )
-        return
-
-    if is_new and referrer_id:
-        ref_owner = await process_referral_reward(
-            message.from_user.id,
-        )
-
-        if ref_owner:
-            try:
-                await bot.send_message(
-                    ref_owner,
-                    "👥 <b>Новый реферал!</b>\n"
-                    f"Игрок <b>{display_name(message.from_user)}</b> "
-                    "перешёл по вашей ссылке.\n"
-                    "Вам начислено <b>+25 🪙</b>.",
-                )
-            except Exception:
-                logger.exception(
-                    "Ошибка уведомления о реферале"
-                )
-
-        await message.answer(
-            "🎉 Вы зарегистрированы по реферальной ссылке!\n"
-            "Пригласившему начислено <b>+25 🪙</b>.",
-        )
-        return
-
-    await message.answer(
-        "👋 <b>Добро пожаловать!</b>\n\n"
-        "🎴 Напишите <b>фем</b>, чтобы получить карту.\n"
-        "📅 Напишите <b>дейлик</b>, чтобы забрать награду.\n"
-        "👤 Команда <b>профиль</b> покажет вашу коллекцию.",
-    )
-
-
-@router.callback_query(F.data == "bonus_check")
-async def bonus_check_callback(
-    callback: CallbackQuery,
-) -> None:
-    user_id = callback.from_user.id
-    current_time = now_ts()
-
-    try:
-        member = await bot.get_chat_member(
-            chat_id=CHANNEL_USERNAME,
-            user_id=user_id,
-        )
-    except Exception:
-        logger.exception("Ошибка проверки подписки")
-        await safe_callback_answer(
-            callback,
-            "Не удалось проверить подписку",
-            show_alert=True,
-        )
-        return
-
-    status = str(member.status)
-
-    if status not in {
-        "creator",
-        "administrator",
-        "member",
-        "restricted",
-    }:
-        await safe_callback_answer(
-            callback,
-            "Сначала подпишитесь на канал",
-            show_alert=True,
-        )
-        return
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT channel_bonus_claimed, last_weekly_bonus
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        if not row:
-            await safe_callback_answer(
-                callback,
-                "Профиль не найден",
-                show_alert=True,
-            )
-            return
-
-        last_bonus = float(row["last_weekly_bonus"] or 0)
-
-        if last_bonus and current_time - last_bonus < 7 * 86400:
-            await safe_callback_answer(
-                callback,
-                "Еженедельный бонус ещё недоступен",
-                show_alert=True,
-            )
-            return
-
-        await db.execute(
-            """
-            UPDATE users
-            SET channel_bonus_claimed = 1,
-                last_weekly_bonus = ?,
-                cd_resets_count = cd_resets_count + 1,
-                cd_reset_expires = ?
-            WHERE user_id = ?
-            """,
-            (
-                current_time,
-                current_time + 3 * 3600,
-                user_id,
-            ),
-        )
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins + 50
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        )
-
-    await safe_callback_answer(
-        callback,
-        "Начислено +50 🪙 и выдан скип КД",
-        show_alert=True,
-    )
-
-# =========================
-# BLOCK 3/5 — ЭКОНОМИКА
-# =========================
-
-async def find_user_by_username(username: str) -> Optional[int]:
-    clean = username.strip().lstrip("@").lower()
-
-    async with db_connection() as db:
-        async with db.execute(
-            """
-            SELECT user_id
-            FROM users
-            WHERE LOWER(REPLACE(username, '@', '')) = ?
-            LIMIT 1
-            """,
-            (clean,),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-    return int(row["user_id"]) if row else None
-
-
-async def resolve_transfer_target(
-    message: Message,
-) -> Optional[int]:
-    if (
-        message.reply_to_message
-        and message.reply_to_message.from_user
-    ):
-        return message.reply_to_message.from_user.id
-
-    if not message.text:
-        return None
-
-    for part in message.text.split()[1:]:
-        if part.startswith("@"):
-            return await find_user_by_username(part)
-
-    return None
-
-
-@router.message(
-    lambda message: command_is(
-        message,
-        "передать",
-        "перевод",
-        "дать",
-        "pay",
-        "transfer",
-    )
-)
-async def transfer_command(message: Message) -> None:
-    await ensure_user(message.from_user)
-
-    if not message.text:
-        return
-
-    amount: Optional[int] = None
-
-    for part in message.text.split()[1:]:
-        if part.isdigit():
-            amount = int(part)
-            break
-
-    if not amount or amount <= 0:
-        await message.answer(
-            "❗ Укажите положительную сумму.\n"
-            "Пример: <code>передать 100</code> ответом "
-            "на сообщение пользователя."
-        )
-        return
-
-    target_id = await resolve_transfer_target(message)
-
-    if not target_id:
-        await message.answer(
-            "❗ Укажите получателя ответом на сообщение "
-            "или через @username."
-        )
-        return
-
-    sender_id = message.from_user.id
-
-    if sender_id == target_id:
-        await message.answer("❌ Нельзя переводить монеты самому себе.")
-        return
-
-    if target_id == bot.id:
-        await message.answer("❌ Нельзя переводить монеты боту.")
-        return
-
-    if not await user_exists(target_id):
-        await message.answer("❌ Получатель ещё не зарегистрирован.")
-        return
-
-    vip = await is_vip(sender_id)
-    commission_percent = 5 if vip else 10
-    commission = max(
-        1,
-        amount * commission_percent // 100,
-    )
-    received = amount - commission
-
-    if received <= 0:
-        await message.answer("❌ Сумма слишком мала.")
-        return
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT femcoins
-            FROM users
-            WHERE user_id = ?
-            """,
-            (sender_id,),
-        ) as cursor:
-            sender = await cursor.fetchone()
-
-        if not sender or int(sender["femcoins"]) < amount:
-            balance = int(sender["femcoins"]) if sender else 0
-            await message.answer(
-                f"❌ Недостаточно монет.\n"
-                f"Ваш баланс: <b>{balance} 🪙</b>"
-            )
-            return
-
-        updated = await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins - ?
-            WHERE user_id = ?
-              AND femcoins >= ?
-            """,
-            (amount, sender_id, amount),
-        )
-
-        if updated.rowcount != 1:
-            await message.answer("❌ Баланс изменился. Повторите перевод.")
-            return
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins + ?
-            WHERE user_id = ?
-            """,
-            (received, target_id),
-        )
-
-    sender_name = await get_username_from_db(sender_id)
-    target_name = await get_username_from_db(target_id)
-
-    await message.answer(
-        "💸 <b>Перевод выполнен!</b>\n\n"
-        f"👤 Отправитель: <b>{sender_name}</b>\n"
-        f"🎯 Получатель: <b>{target_name}</b>\n"
-        f"📤 Отправлено: <b>{amount} 🪙</b>\n"
-        f"📥 Получено: <b>{received} 🪙</b>\n"
-        f"🔥 Комиссия: <b>{commission} 🪙</b> "
-        f"({commission_percent}%)"
-    )
-
-
-def shop_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔄 Сброс КД — 150 🪙",
-                    callback_data="shop:cd",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🍀 Эликсир удачи — 250 🪙",
-                    callback_data="shop:luck",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎴 Новая карта — 400 🪙",
-                    callback_data="shop:newcard",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🛡 Артефакты",
-                    callback_data="shop:artifacts",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👑 Купить VIP",
-                    callback_data="shop:vip",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💰 Купить фемкоины",
-                    callback_data="shop:coins",
-                )
-            ],
-        ]
-    )
-
-
-@router.message(
-    lambda message: command_is(
-        message,
-        "магазин",
-        "shop",
-    )
-)
-async def shop_command(message: Message) -> None:
-    await ensure_user(message.from_user)
-
-    if message.chat.type != ChatType.PRIVATE:
-        bot_info = await bot.get_me()
-
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="🏪 Открыть магазин",
-                        url=(
-                            f"https://t.me/{bot_info.username}"
-                            "?start=shop"
-                        ),
-                    )
-                ]
-            ]
-        )
-
-        await message.answer(
-            "🏪 Магазин доступен только в личных сообщениях.",
-            reply_markup=keyboard,
-        )
-        return
-
-    async with db_connection() as db:
-        async with db.execute(
-            "SELECT femcoins FROM users WHERE user_id = ?",
-            (message.from_user.id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-    balance = int(row["femcoins"]) if row else 0
-
-    await message.answer(
-        "🏪 <b>Магазин</b>\n\n"
-        f"Ваш баланс: <b>{balance} 🪙</b>\n\n"
-        "Выберите товар:",
-        reply_markup=shop_keyboard(),
-    )
-
-
-async def render_shop(
-    callback: CallbackQuery,
-) -> None:
-    async with db_connection() as db:
-        async with db.execute(
-            "SELECT femcoins FROM users WHERE user_id = ?",
-            (callback.from_user.id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-    balance = int(row["femcoins"]) if row else 0
-
-    await safe_edit_text(
-        callback.message,
-        "🏪 <b>Магазин</b>\n\n"
-        f"Ваш баланс: <b>{balance} 🪙</b>\n\n"
-        "Выберите товар:",
-        shop_keyboard(),
-    )
-
-
-@router.callback_query(F.data == "shop:main")
-async def shop_main_callback(callback: CallbackQuery) -> None:
-    await render_shop(callback)
-    await safe_callback_answer(callback)
-
-
-@router.callback_query(F.data == "shop:cd")
-async def shop_cd_callback(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    current_time = now_ts()
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT femcoins, cd_resets_count,
-                   cd_reset_expires
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        if not row or int(row["femcoins"]) < 150:
-            await safe_callback_answer(
-                callback,
-                "Недостаточно монет",
-                show_alert=True,
-            )
-            return
-
-        old_count = int(row["cd_resets_count"] or 0)
-        old_expires = float(row["cd_reset_expires"] or 0)
-
-        if old_expires <= current_time:
-            old_count = 0
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins - 150,
-                cd_resets_count = ?,
-                cd_reset_expires = ?
-            WHERE user_id = ?
-              AND femcoins >= 150
-            """,
-            (
-                old_count + 1,
-                current_time + 3 * 3600,
-                user_id,
-            ),
-        )
-
-    await safe_callback_answer(
-        callback,
-        f"Скипов КД: {old_count + 1}",
-        show_alert=True,
-    )
-
-
-@router.callback_query(F.data == "shop:luck")
-async def shop_luck_callback(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    current_time = now_ts()
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT femcoins, luck_expires
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        if not row or int(row["femcoins"]) < 250:
-            await safe_callback_answer(
-                callback,
-                "Недостаточно монет",
-                show_alert=True,
-            )
-            return
-
-        old_expires = float(row["luck_expires"] or 0)
-        start = max(current_time, old_expires)
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins - 250,
-                luck_expires = ?
-            WHERE user_id = ?
-              AND femcoins >= 250
-            """,
-            (start + 3 * 3600, user_id),
-        )
-
-    await safe_callback_answer(
-        callback,
-        "Эликсир удачи активирован на 3 часа",
-        show_alert=True,
-    )
-
-
-@router.callback_query(F.data == "shop:newcard")
-async def shop_new_card_callback(
-    callback: CallbackQuery,
-) -> None:
-    user_id = callback.from_user.id
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT femcoins
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            user = await cursor.fetchone()
-
-        if not user or int(user["femcoins"]) < 400:
-            await safe_callback_answer(
-                callback,
-                "Недостаточно монет",
-                show_alert=True,
-            )
-            return
-
-        async with db.execute(
-            """
-            SELECT id, file_id, rarity, description
-            FROM cards
-            WHERE id NOT IN (
-                SELECT card_id
-                FROM inventory
-                WHERE user_id = ?
-            )
-            ORDER BY RANDOM()
-            LIMIT 1
-            """,
-            (user_id,),
-        ) as cursor:
-            card = await cursor.fetchone()
-
-        if not card:
-            await safe_callback_answer(
-                callback,
-                "У вас уже собраны все карты",
-                show_alert=True,
-            )
-            return
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins - 400
-            WHERE user_id = ?
-              AND femcoins >= 400
-            """,
-            (user_id,),
-        )
-
-        await db.execute(
-            """
-            INSERT INTO inventory(user_id, card_id, count)
-            VALUES (?, ?, 1)
-            ON CONFLICT(user_id, card_id)
-            DO UPDATE SET count = count + 1
-            """,
-            (user_id, int(card["id"])),
-        )
-
-    caption = (
-        f"🎴 <b>Новая карта #{int(card['id'])}!</b>\n\n"
-        f"🏷 Редкость: <b>{esc(card['rarity'])}</b>\n"
-        f"📝 {esc(card['description']) or 'Без описания'}"
-    )
-
-    await callback.message.answer_photo(
-        card["file_id"],
-        caption=caption,
-    )
-
-    await safe_callback_answer(callback, "Карта куплена")
-
-
-@router.callback_query(F.data == "shop:artifacts")
-async def shop_artifacts_callback(
-    callback: CallbackQuery,
-) -> None:
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔰 Слабый щит — 30 🪙",
-                    callback_data="artifact_shop:weak",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🛡 Броня — 300 🪙",
-                    callback_data="artifact_shop:armor",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="shop:main",
-                )
-            ],
-        ]
-    )
-
-    await safe_edit_text(
-        callback.message,
-        "🛡 <b>Артефакты</b>\n\n"
-        "Усиленный и фембойский щиты напрямую не продаются.",
-        keyboard,
-    )
-    await safe_callback_answer(callback)
-
-
-@router.callback_query(F.data == "artifact_shop:weak")
-async def buy_weak_shield_callback(
-    callback: CallbackQuery,
-) -> None:
-    user_id = callback.from_user.id
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT femcoins
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            user = await cursor.fetchone()
-
-        if not user or int(user["femcoins"]) < 30:
-            await safe_callback_answer(
-                callback,
-                "Недостаточно монет",
-                show_alert=True,
-            )
-            return
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins - 30
-            WHERE user_id = ?
-              AND femcoins >= 30
-            """,
-            (user_id,),
-        )
-
-        await db.execute(
-            """
-            INSERT INTO artifacts(
-                user_id, artifact_type, subtype,
-                amount, created_at
-            )
-            VALUES (?, 'shield', 'weak', 1, ?)
-            ON CONFLICT(user_id, artifact_type, subtype)
-            DO UPDATE SET amount = amount + 1
-            """,
-            (user_id, now_ts()),
-        )
-
-    await safe_callback_answer(
-        callback,
-        "Слабый щит куплен",
-        show_alert=True,
-    )
-
-
-@router.callback_query(F.data == "artifact_shop:armor")
-async def buy_armor_callback(
-    callback: CallbackQuery,
-) -> None:
-    user_id = callback.from_user.id
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT femcoins
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            user = await cursor.fetchone()
-
-        if not user or int(user["femcoins"]) < 300:
-            await safe_callback_answer(
-                callback,
-                "Недостаточно монет",
-                show_alert=True,
-            )
-            return
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins - 300
-            WHERE user_id = ?
-              AND femcoins >= 300
-            """,
-            (user_id,),
-        )
-
-        await db.execute(
-            """
-            INSERT INTO artifacts(
-                user_id, artifact_type, subtype,
-                amount, created_at
-            )
-            VALUES (?, 'armor', '', 1, ?)
-            ON CONFLICT(user_id, artifact_type, subtype)
-            DO UPDATE SET amount = amount + 1
-            """,
-            (user_id, now_ts()),
-        )
-
-    await safe_callback_answer(
-        callback,
-        "Броня куплена",
-        show_alert=True,
-    )
-
-
-VIP_TEXT = (
-    "👑 <b>VIP-статус</b>\n\n"
-    "• 20% шанс получить вторую карту;\n"
-    "• кулдаун фема — 2 часа;\n"
-    "• компенсация VIP-дубликатов;\n"
-    "• улучшенные веса карт;\n"
-    "• комиссия переводов — 5%;\n"
-    "• дейлик каждые 22 часа;\n"
-    "• +5 монет к дейлику."
-)
-
-
-def vip_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🪙 За фемкоины",
-                    callback_data="vip:coins",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⭐ За Stars",
-                    callback_data="vip:stars",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="shop:main",
-                )
-            ],
-        ]
-    )
-
-
-@router.callback_query(F.data == "shop:vip")
-async def shop_vip_callback(callback: CallbackQuery) -> None:
-    await safe_edit_text(
-        callback.message,
-        VIP_TEXT,
-        vip_keyboard(),
-    )
-    await safe_callback_answer(callback)
-
-
-@router.message(
-    lambda message: command_is(
-        message,
-        "vip",
-        "вип",
-        "купить вип",
-    )
-)
-async def vip_command(message: Message) -> None:
-    await ensure_user(message.from_user)
-
-    await message.answer(
-        VIP_TEXT,
-        reply_markup=vip_keyboard(),
-    )
-
-
-@router.callback_query(F.data == "vip:coins")
-async def vip_coins_menu_callback(
-    callback: CallbackQuery,
-) -> None:
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="1 день — 1500 🪙",
-                    callback_data="vip_coins:1",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="7 дней — 4500 🪙",
-                    callback_data="vip_coins:7",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="30 дней — 10000 🪙",
-                    callback_data="vip_coins:30",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="shop:vip",
-                )
-            ],
-        ]
-    )
-
-    await safe_edit_text(
-        callback.message,
-        VIP_TEXT + "\n\nВыберите срок:",
-        keyboard,
-    )
-    await safe_callback_answer(callback)
-
-
-@router.callback_query(F.data.startswith("vip_coins:"))
-async def buy_vip_coins_callback(
-    callback: CallbackQuery,
-) -> None:
-    raw_days = parse_callback(
-        callback.data or "",
-        "vip_coins:",
-    )
-
-    try:
-        days = int(raw_days or "0")
-    except ValueError:
-        await safe_callback_answer(
-            callback,
-            "Некорректный срок",
-            show_alert=True,
-        )
-        return
-
-    prices = {
-        1: 1500,
-        7: 4500,
-        30: 10000,
-    }
-
-    if days not in prices:
-        await safe_callback_answer(
-            callback,
-            "Некорректный срок",
-            show_alert=True,
-        )
-        return
-
-    user_id = callback.from_user.id
-    current_time = now_ts()
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT femcoins, vip_until
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            user = await cursor.fetchone()
-
-        if not user or int(user["femcoins"]) < prices[days]:
-            await safe_callback_answer(
-                callback,
-                "Недостаточно фемкоинов",
-                show_alert=True,
-            )
-            return
-
-        vip_until = max(
-            current_time,
-            float(user["vip_until"] or 0),
-        )
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins - ?,
-                vip_until = ?
-            WHERE user_id = ?
-              AND femcoins >= ?
-            """,
-            (
-                prices[days],
-                vip_until + days * 86400,
-                user_id,
-                prices[days],
-            ),
-        )
-
-    await safe_callback_answer(
-        callback,
-        f"VIP активирован на {days} дн.",
-        show_alert=True,
-    )
-
-
-@router.callback_query(F.data == "vip:stars")
-async def vip_stars_menu_callback(
-    callback: CallbackQuery,
-) -> None:
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="1 день — 250 ⭐",
-                    callback_data="vip_stars:1",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="7 дней — 800 ⭐",
-                    callback_data="vip_stars:7",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="30 дней — 2000 ⭐",
-                    callback_data="vip_stars:30",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="shop:vip",
-                )
-            ],
-        ]
-    )
-
-    await safe_edit_text(
-        callback.message,
-        VIP_TEXT + "\n\nВыберите срок:",
-        keyboard,
-    )
-    await safe_callback_answer(callback)
-
-
-@router.callback_query(F.data.startswith("vip_stars:"))
-async def vip_stars_invoice_callback(
-    callback: CallbackQuery,
-) -> None:
-    raw_days = parse_callback(
-        callback.data or "",
-        "vip_stars:",
-    )
-
-    try:
-        days = int(raw_days or "0")
-    except ValueError:
-        await safe_callback_answer(
-            callback,
-            "Некорректный срок",
-            show_alert=True,
-        )
-        return
-
-    prices = {
-        1: 250,
-        7: 800,
-        30: 2000,
-    }
-
-    if days not in prices:
-        await safe_callback_answer(
-            callback,
-            "Некорректный срок",
-            show_alert=True,
-        )
-        return
-
-    await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title=f"VIP на {days} дн.",
-        description=f"VIP-статус на {days} дней",
-        payload=f"vip:{days}",
-        currency="XTR",
-        prices=[
-            LabeledPrice(
-                label=f"VIP на {days} дн.",
-                amount=prices[days],
-            )
-        ],
-        provider_token="",
-    )
-
-    await safe_callback_answer(callback)
-
-
-@router.callback_query(F.data == "shop:coins")
-async def shop_coins_callback(
-    callback: CallbackQuery,
-) -> None:
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="100 монет — 15 ⭐",
-                    callback_data="coins_stars:100",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="500 монет — 70 ⭐",
-                    callback_data="coins_stars:500",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="1000 монет — 135 ⭐",
-                    callback_data="coins_stars:1000",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="shop:main",
-                )
-            ],
-        ]
-    )
-
-    await safe_edit_text(
-        callback.message,
-        "💰 <b>Покупка фемкоинов</b>",
-        keyboard,
-    )
-    await safe_callback_answer(callback)
-
-
-@router.callback_query(F.data.startswith("coins_stars:"))
-async def coins_stars_invoice_callback(
-    callback: CallbackQuery,
-) -> None:
-    raw_amount = parse_callback(
-        callback.data or "",
-        "coins_stars:",
-    )
-
-    try:
-        amount = int(raw_amount or "0")
-    except ValueError:
-        await safe_callback_answer(
-            callback,
-            "Некорректная сумма",
-            show_alert=True,
-        )
-        return
-
-    prices = {
-        100: 15,
-        500: 70,
-        1000: 135,
-    }
-
-    if amount not in prices:
-        await safe_callback_answer(
-            callback,
-            "Некорректная сумма",
-            show_alert=True,
-        )
-        return
-
-    await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title=f"{amount} фемкоинов",
-        description=f"Покупка {amount} игровых монет",
-        payload=f"coins:{amount}",
-        currency="XTR",
-        prices=[
-            LabeledPrice(
-                label=f"{amount} фемкоинов",
-                amount=prices[amount],
-            )
-        ],
-        provider_token="",
-    )
-
-    await safe_callback_answer(callback)
-
-
-@router.pre_checkout_query()
-async def pre_checkout_handler(
-    query: PreCheckoutQuery,
-) -> None:
-    try:
-        await query.answer(ok=True)
-    except Exception:
-        logger.exception("Ошибка pre-checkout")
-
-
-@router.message(F.successful_payment)
-async def successful_payment_handler(
-    message: Message,
-) -> None:
-    payment = message.successful_payment
-
-    if not payment:
-        return
-
-    payload = payment.invoice_payload
-    user_id = message.from_user.id
-
-    if payload.startswith("coins:"):
-        try:
-            amount = int(payload.split(":", 1)[1])
-        except ValueError:
-            return
-
-        if amount not in {100, 500, 1000}:
-            return
-
-        async with transaction() as db:
-            await db.execute(
-                """
-                UPDATE users
-                SET femcoins = femcoins + ?
-                WHERE user_id = ?
-                """,
-                (amount, user_id),
-            )
-
-        await message.answer(
-            f"⭐ Оплата прошла успешно.\n"
-            f"Начислено: <b>+{amount} 🪙</b>"
-        )
-        return
-
-    if payload.startswith("vip:"):
-        try:
-            days = int(payload.split(":", 1)[1])
-        except ValueError:
-            return
-
-        if days not in {1, 7, 30}:
-            return
-
-        current_time = now_ts()
-
-        async with transaction() as db:
-            async with db.execute(
-                """
-                SELECT vip_until
-                FROM users
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
-
-            old_vip = float(row["vip_until"] or 0) if row else 0
-            new_vip = max(current_time, old_vip) + days * 86400
-
-            await db.execute(
-                """
-                UPDATE users
-                SET vip_until = ?
-                WHERE user_id = ?
-                """,
-                (new_vip, user_id),
-            )
-
-        await message.answer(
-            "⭐ Оплата прошла успешно.\n"
-            f"VIP активирован на <b>{days} дн.</b>"
-        )
-
-
-@router.message(
-    lambda message: command_is(
-        message,
-        "промо",
-        "promo",
-    )
-)
-async def promo_command(message: Message, state: FSMContext) -> None:
-    await ensure_user(message.from_user)
-
-    await state.set_state(UserStates.waiting_promo_code)
-
-    await message.answer(
-        "🔑 Отправьте промокод отдельным текстовым сообщением."
-    )
-
-
-@router.message(UserStates.waiting_promo_code)
-async def promo_code_handler(
-    message: Message,
-    state: FSMContext,
-) -> None:
-    if not message.text:
-        await message.answer("❌ Промокод должен быть текстом.")
-        return
-
-    code = message.text.strip().upper()
-    user_id = message.from_user.id
-    current_time = now_ts()
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT p_type, reward_type, reward_val,
-                   expires_at, is_used
-            FROM promo_codes
-            WHERE UPPER(code) = ?
-            """,
-            (code,),
-        ) as cursor:
-            promo = await cursor.fetchone()
-
-        if not promo:
-            await state.clear()
-            await message.answer("❌ Промокод не найден.")
-            return
-
-        if float(promo["expires_at"]) <= current_time:
-            await state.clear()
-            await message.answer("⌛ Срок действия промокода истёк.")
-            return
-
-        if (
-            str(promo["p_type"]).upper() == "L"
-            and int(promo["is_used"] or 0) == 1
-        ):
-            await state.clear()
-            await message.answer("❌ Промокод уже использован.")
-            return
-
-        async with db.execute(
-            """
-            SELECT 1
-            FROM promo_claims
-            WHERE user_id = ? AND code = ?
-            """,
-            (user_id, code),
-        ) as cursor:
-            already_claimed = await cursor.fetchone()
-
-        if already_claimed:
-            await state.clear()
-            await message.answer("❌ Вы уже использовали этот промокод.")
-            return
-
-        reward_type = str(promo["reward_type"]).lower()
-        reward_value = int(promo["reward_val"] or 0)
-
-        if reward_type == "f":
-            await db.execute(
-                """
-                UPDATE users
-                SET femcoins = femcoins + ?
-                WHERE user_id = ?
-                """,
-                (reward_value, user_id),
-            )
-            reward_text = f"+{reward_value} 🪙"
-
-        elif reward_type == "k":
-            await db.execute(
-                """
-                UPDATE users
-                SET cd_resets_count = cd_resets_count + 1,
-                    cd_reset_expires = ?
-                WHERE user_id = ?
-                """,
-                (
-                    current_time + 3 * 3600,
-                    user_id,
-                ),
-            )
-            reward_text = "скип кулдауна"
-
-        elif reward_type == "v":
-            async with db.execute(
-                """
-                SELECT vip_until
-                FROM users
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            ) as cursor:
-                user = await cursor.fetchone()
-
-            old_vip = float(user["vip_until"] or 0) if user else 0
-            new_vip = max(current_time, old_vip) + reward_value * 3600
-
-            await db.execute(
-                """
-                UPDATE users
-                SET vip_until = ?
-                WHERE user_id = ?
-                """,
-                (new_vip, user_id),
-            )
-            reward_text = f"VIP на {reward_value} ч"
-
-        else:
-            await state.clear()
-            await message.answer("❌ Неизвестный тип награды.")
-            return
-
-        await db.execute(
-            """
-            INSERT INTO promo_claims(user_id, code, claimed_at)
-            VALUES (?, ?, ?)
-            """,
-            (user_id, code, current_time),
-        )
-
-        if str(promo["p_type"]).upper() == "L":
-            await db.execute(
-                """
-                UPDATE promo_codes
-                SET is_used = 1
-                WHERE code = ?
-                """,
-                (code,),
-            )
-
-    await state.clear()
-
-    await message.answer(
-        "🎉 <b>Промокод активирован!</b>\n"
-        f"Награда: <b>{esc(reward_text)}</b>"
-    )
-
-
-def casino_keyboard(bet: int) -> InlineKeyboardMarkup:
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=f"{'✅ ' if bet == value else ''}{value} 🪙",
-                callback_data=f"casino_bet:{value}",
-            )
-            for value in sorted(CASINO_BETS)
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"🎲 Кости — {bet} 🪙",
-                callback_data="casino: dice",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"🔴 Красное x2 — {bet}",
-                callback_data="casino:red",
-            ),
-            InlineKeyboardButton(
-                text=f"⚫ Чёрное x2 — {bet}",
-                callback_data="casino:black",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"🟢 Зеро x14 — {bet}",
-                callback_data="casino:zero",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=f"🎰 Слоты — {bet} 🪙",
-                callback_data="casino:slots",
-            )
-        ],
-    ]
-
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@router.message(
-    lambda message: command_is(
-        message,
-        "казино",
-        "kaz",
-    )
-)
-async def casino_command(message: Message) -> None:
-    await ensure_user(message.from_user)
-
-    bet = user_casino_bets.get(message.from_user.id, 20)
-
-    await message.answer(
-        "🎰 <b>Фем-казино</b>\n\n"
-        f"Текущая ставка: <b>{bet} 🪙</b>\n"
-        "Для рулетки минимальная ставка — 20 монет.",
-        reply_markup=casino_keyboard(bet),
-    )
-
-
-@router.callback_query(F.data.startswith("casino_bet:"))
-async def casino_bet_callback(
-    callback: CallbackQuery,
-) -> None:
-    raw_bet = parse_callback(
-        callback.data or "",
-        "casino_bet:",
-    )
-
-    try:
-        bet = int(raw_bet or "0")
-    except ValueError:
-        await safe_callback_answer(
-            callback,
-            "Некорректная ставка",
-            show_alert=True,
-        )
-        return
-
-    if bet not in CASINO_BETS:
-        await safe_callback_answer(
-            callback,
-            "Некорректная ставка",
-            show_alert=True,
-        )
-        return
-
-    user_casino_bets[callback.from_user.id] = bet
-
-    await safe_edit_text(
-        callback.message,
-        "🎰 <b>Фем-казино</b>\n\n"
-        f"Текущая ставка: <b>{bet} 🪙</b>",
-        casino_keyboard(bet),
-    )
-
-    await safe_callback_answer(
-        callback,
-        f"Ставка: {bet} 🪙",
-    )
-
-
-@router.callback_query(F.data.startswith("casino:"))
-async def casino_game_callback(
-    callback: CallbackQuery,
-) -> None:
-    action = parse_callback(
-        callback.data or "",
-        "casino:",
-    )
-
-    if not action:
-        await safe_callback_answer(
-            callback,
-            "Некорректная игра",
-            show_alert=True,
-        )
-        return
-
-    action = action.strip()
-    user_id = callback.from_user.id
-    bet = user_casino_bets.get(user_id, 20)
-
-    if action in {"red", "black", "zero"} and bet < 20:
-        await safe_callback_answer(
-            callback,
-            "Для рулетки нужна ставка минимум 20",
-            show_alert=True,
-        )
-        return
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT femcoins
-            FROM users
-            WHERE user_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            user = await cursor.fetchone()
-
-        if not user or int(user["femcoins"]) < bet:
-            await safe_callback_answer(
-                callback,
-                "Недостаточно монет",
-                show_alert=True,
-            )
-            return
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins - ?
-            WHERE user_id = ?
-              AND femcoins >= ?
-            """,
-            (bet, user_id, bet),
-        )
-
-        result_text = ""
-
-        if action == "dice":
-            player = random.randint(1, 6)
-            dealer = random.randint(1, 6)
-
-            if player > dealer:
-                net = bet
-                await db.execute(
-                    """
-                    UPDATE users
-                    SET femcoins = femcoins + ?
-                    WHERE user_id = ?
-                    """,
-                    (net, user_id),
-                )
-                result_text = (
-                    f"🎲 Вы выиграли: "
-                    f"{player} против {dealer}.\n"
-                    f"Прибыль: <b>+{net} 🪙</b>"
-                )
-            elif player < dealer:
-                result_text = (
-                    f"🎲 Вы проиграли: "
-                    f"{player} против {dealer}.\n"
-                    f"Потеря: <b>-{bet} 🪙</b>"
-                )
-            else:
-                await db.execute(
-                    """
-                    UPDATE users
-                    SET femcoins = femcoins + ?
-                    WHERE user_id = ?
-                    """,
-                    (bet, user_id),
-                )
-                result_text = (
-                    f"🎲 Ничья: {player} и {dealer}.\n"
-                    "Ставка возвращена."
-                )
-
-        elif action in {"red", "black", "zero"}:
-            number = random.randint(0, 36)
-
-            if number == 0:
-                color = "zero"
-            elif number % 2:
-                color = "red"
-            else:
-                color = "black"
-
-            if action == color:
-                multiplier = 14 if action == "zero" else 2
-                net = bet * multiplier - bet
-
-                await db.execute(
-                    """
-                    UPDATE users
-                    SET femcoins = femcoins + ?
-                    WHERE user_id = ?
-                    """,
-                    (bet + net, user_id),
-                )
-
-                result_text = (
-                    f"🎡 Выпало число <b>{number}</b>.\n"
-                    f"Победа! Прибыль: <b>+{net} 🪙</b>"
-                )
-            else:
-                result_text = (
-                    f"🎡 Выпало число <b>{number}</b>.\n"
-                    f"Потеря: <b>-{bet} 🪙</b>"
-                )
-
-        elif action == "slots":
-            symbols = ["🍒", "🍋", "🍇", "💎", "7️⃣"]
-            result = random.choices(symbols, k=3)
-
-            if result[0] == result[1] == result[2] == "7️⃣":
-                multiplier = 15
-            elif result[0] == result[1] == result[2]:
-                multiplier = 4
-            else:
-                multiplier = 0
-
-            if multiplier:
-                total_return = bet * multiplier
-                net = total_return - bet
-
-                await db.execute(
-                    """
-                    UPDATE users
-                    SET femcoins = femcoins + ?
-                    WHERE user_id = ?
-                    """,
-                    (total_return, user_id),
-                )
-
-                result_text = (
-                    f"🎰 {' | '.join(result)}\n"
-                    f"Победа! Прибыль: <b>+{net} 🪙</b>"
-                )
-            else:
-                result_text = (
-                    f"🎰 {' | '.join(result)}\n"
-                    f"Потеря: <b>-{bet} 🪙</b>"
-                )
-
-        else:
-            await db.rollback()
-            await safe_callback_answer(
-                callback,
-                "Неизвестная игра",
-                show_alert=True,
-            )
-            return
-
-    await callback.message.answer(result_text)
-    await safe_callback_answer(callback)
-
-# =========================
-# BLOCK 4/5 — ФЕМ И СУНДУКИ
-# =========================
-
-import json
-
-
-user_fem_locks: dict[int, asyncio.Lock] = {}
-
-
-def get_user_fem_lock(user_id: int) -> asyncio.Lock:
-    lock = user_fem_locks.get(user_id)
-
-    if lock is None:
-        lock = asyncio.Lock()
-        user_fem_locks[user_id] = lock
-
-    return lock
-
-
-def chest_keyboard(chest_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎁 Забрать сундук",
-                    callback_data=f"chest:{chest_id}",
-                )
-            ]
-        ]
-    )
-
-
-async def create_chest(
-    chat_id: int,
-    chest_type: str,
-    payload: dict[str, Any],
-    *,
-    lifetime: int = 3600,
-) -> str:
-    chest_id = secrets.token_urlsafe(10).replace("-", "").replace("_", "")
-    created_at = now_ts()
-
-    async with transaction() as db:
-        await db.execute(
-            """
-            INSERT INTO chests(
-                chest_id,
-                chat_id,
-                chest_type,
-                payload,
-                created_at,
-                expires_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                chest_id,
-                chat_id,
-                chest_type,
-                json.dumps(payload, ensure_ascii=False),
-                created_at,
-                created_at + lifetime,
-            ),
-        )
-
-    return chest_id
-
-
-async def choose_group_chest() -> tuple[str, dict[str, Any]]:
-    roll = random.random()
-
-    if roll < 0.005:
-        return "artifact", {}
-
-    if roll < 0.025:
-        return "legendary", {
-            "coins": random.randint(100, 199),
-        }
-
-    if roll < 0.05:
-        return "rare", {
-            "coins": random.randint(50, 99),
-        }
-
-    return "normal", {
-        "coins": random.randint(5, 49),
-    }
-
-
-async def send_group_chest(chat_id: int) -> None:
-    chest_type, payload = await choose_group_chest()
-    chest_id = await create_chest(
-        chat_id,
-        chest_type,
-        payload,
-    )
-
-    if chest_type == "normal":
-        text = (
-            "📦 <b>Появился обычный сундук!</b>\n"
-            "Кто первым нажмёт кнопку, получит награду."
-        )
-    elif chest_type == "rare":
-        text = (
-            "💎 <b>Появился редкий сундук!</b>\n"
-            "Внутри спрятана ценная награда."
-        )
-    elif chest_type == "legendary":
-        text = (
-            "🌟 <b>Появился легендарный сундук!</b>\n"
-            "Внутри монеты и независимый шанс получить клинок."
-        )
-    else:
-        text = (
-            "🩷 <b>Появился фембойский артефактный сундук!</b>\n"
-            "Внутри находятся редкие предметы."
-        )
-
-    try:
-        sent = await bot.send_message(
-            chat_id,
-            text,
-            reply_markup=chest_keyboard(chest_id),
-        )
-
-        async with transaction() as db:
-            await db.execute(
-                """
-                UPDATE chests
-                SET message_id = ?
-                WHERE chest_id = ?
-                """,
-                (sent.message_id, chest_id),
-            )
-    except Exception:
-        logger.exception("Ошибка отправки сундука")
-
-
-async def grant_chest_reward(
-    db: aiosqlite.Connection,
-    user_id: int,
-    chest_type: str,
-    payload: dict[str, Any],
-) -> str:
-    rewards: list[str] = []
-
-    if chest_type == "normal":
-        coins = int(payload.get("coins", 5))
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins + ?
-            WHERE user_id = ?
-            """,
-            (coins, user_id),
-        )
-        rewards.append(f"+{coins} 🪙")
-
-    elif chest_type == "rare":
-        coins = int(payload.get("coins", 50))
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins + ?
-            WHERE user_id = ?
-            """,
-            (coins, user_id),
-        )
-        rewards.append(f"+{coins} 🪙")
-
-    elif chest_type == "legendary":
-        coins = int(payload.get("coins", 100))
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins + ?
-            WHERE user_id = ?
-            """,
-            (coins, user_id),
-        )
-        rewards.append(f"+{coins} 🪙")
-
-        if random.random() < 0.05:
-            await db.execute(
-                """
-                INSERT INTO artifacts(
-                    user_id,
-                    artifact_type,
-                    subtype,
-                    amount,
-                    created_at
-                )
-                VALUES (?, 'blade', '', 1, ?)
-                ON CONFLICT(user_id, artifact_type, subtype)
-                DO UPDATE SET amount = amount + 1
-                """,
-                (user_id, now_ts()),
-            )
-            rewards.append("+1 клинок")
-
-    elif chest_type == "artifact":
-        roll = random.random()
-
-        if roll < 0.50:
-            coins = random.randint(200, 299)
-
-            await db.execute(
-                """
-                UPDATE users
-                SET femcoins = femcoins + ?
-                WHERE user_id = ?
-                """,
-                (coins, user_id),
-            )
-
-            await db.execute(
-                """
-                INSERT INTO artifacts(
-                    user_id,
-                    artifact_type,
-                    subtype,
-                    amount,
-                    created_at
-                )
-                VALUES (?, 'blade', '', 1, ?)
-                ON CONFLICT(user_id, artifact_type, subtype)
-                DO UPDATE SET amount = amount + 1
-                """,
-                (user_id, now_ts()),
-            )
-
-            rewards.extend([f"+{coins} 🪙", "+1 клинок"])
-
-        elif roll < 0.75:
-            coins = random.randint(300, 349)
-
-            await db.execute(
-                """
-                UPDATE users
-                SET femcoins = femcoins + ?,
-                    cd_resets_count = cd_resets_count + 1,
-                    cd_reset_expires = ?
-                WHERE user_id = ?
-                """,
-                (
-                    coins,
-                    now_ts() + 3 * 3600,
-                    user_id,
-                ),
-            )
-
-            await db.execute(
-                """
-                INSERT INTO artifacts(
-                    user_id,
-                    artifact_type,
-                    subtype,
-                    amount,
-                    created_at
-                )
-                VALUES (?, 'blade', '', 1, ?)
-                ON CONFLICT(user_id, artifact_type, subtype)
-                DO UPDATE SET amount = amount + 1
-                """,
-                (user_id, now_ts()),
-            )
-
-            rewards.extend(
-                [
-                    f"+{coins} 🪙",
-                    "+1 клинок",
-                    "+1 скип КД",
-                ]
-            )
-
-        elif roll < 0.92:
-            coins = random.randint(300, 349)
-
-            await db.execute(
-                """
-                UPDATE users
-                SET femcoins = femcoins + ?,
-                    cd_resets_count = cd_resets_count + 1,
-                    cd_reset_expires = ?
-                WHERE user_id = ?
-                """,
-                (
-                    coins,
-                    now_ts() + 3 * 3600,
-                    user_id,
-                ),
-            )
-
-            await db.execute(
-                """
-                INSERT INTO artifacts(
-                    user_id,
-                    artifact_type,
-                    subtype,
-                    amount,
-                    created_at
-                )
-                VALUES (?, 'blade', '', 1, ?)
-                ON CONFLICT(user_id, artifact_type, subtype)
-                DO UPDATE SET amount = amount + 1
-                """,
-                (user_id, now_ts()),
-            )
-
-            await db.execute(
-                """
-                INSERT INTO artifacts(
-                    user_id,
-                    artifact_type,
-                    subtype,
-                    amount,
-                    created_at
-                )
-                VALUES (?, 'shield', 'weak', 1, ?)
-                ON CONFLICT(user_id, artifact_type, subtype)
-                DO UPDATE SET amount = amount + 1
-                """,
-                (user_id, now_ts()),
-            )
-
-            rewards.extend(
-                [
-                    f"+{coins} 🪙",
-                    "+1 клинок",
-                    "+1 слабый щит",
-                    "+1 скип КД",
-                ]
-            )
-
-        else:
-            await db.execute(
-                """
-                INSERT INTO artifacts(
-                    user_id,
-                    artifact_type,
-                    subtype,
-                    amount,
-                    created_at
-                )
-                VALUES (?, 'blade', '', 2, ?)
-                ON CONFLICT(user_id, artifact_type, subtype)
-                DO UPDATE SET amount = amount + 2
-                """,
-                (user_id, now_ts()),
-            )
-
-            await db.execute(
-                """
-                INSERT INTO artifacts(
-                    user_id,
-                    artifact_type,
-                    subtype,
-                    amount,
-                    created_at
-                )
-                VALUES (?, 'shield', 'weak', 2, ?)
-                ON CONFLICT(user_id, artifact_type, subtype)
-                DO UPDATE SET amount = amount + 2
-                """,
-                (user_id, now_ts()),
-            )
-
-            await db.execute(
-                """
-                UPDATE users
-                SET cd_resets_count = cd_resets_count + 1,
-                    cd_reset_expires = ?
-                WHERE user_id = ?
-                """,
-                (
-                    now_ts() + 3 * 3600,
-                    user_id,
-                ),
-            )
-
-            rewards.extend(
-                [
-                    "+2 клинка",
-                    "+2 слабых щита",
-                    "+1 сброс КД",
-                ]
-            )
-
-    return ", ".join(rewards)
-
-
-@router.callback_query(F.data.startswith("chest:"))
-async def chest_claim_callback(
-    callback: CallbackQuery,
-) -> None:
-    chest_id = parse_callback(
-        callback.data or "",
-        "chest:",
-    )
-
-    if not chest_id:
-        await safe_callback_answer(
-            callback,
-            "Некорректный сундук",
-            show_alert=True,
-        )
-        return
-
-    user_id = callback.from_user.id
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT chest_type, payload, claimed_by,
-                   expires_at
-            FROM chests
-            WHERE chest_id = ?
-            """,
-            (chest_id,),
-        ) as cursor:
-            chest = await cursor.fetchone()
-
-        if not chest:
-            await safe_callback_answer(
-                callback,
-                "Сундук не найден или уже удалён",
-                show_alert=True,
-            )
-            return
-
-        if chest["claimed_by"] is not None:
-            await safe_callback_answer(
-                callback,
-                "Сундук уже забрали",
-                show_alert=True,
-            )
-            return
-
-        if float(chest["expires_at"]) <= now_ts():
-            await safe_callback_answer(
-                callback,
-                "Срок действия сундука истёк",
-                show_alert=True,
-            )
-            return
-
-        claimed = await db.execute(
-            """
-            UPDATE chests
-            SET claimed_by = ?,
-                claimed_at = ?
-            WHERE chest_id = ?
-              AND claimed_by IS NULL
-              AND expires_at > ?
-            """,
-            (
-                user_id,
-                now_ts(),
-                chest_id,
-                now_ts(),
-            ),
-        )
-
-        if claimed.rowcount != 1:
-            await safe_callback_answer(
-                callback,
-                "Сундук уже забрали",
-                show_alert=True,
-            )
-            return
-
-        try:
-            payload = json.loads(chest["payload"] or "{}")
-        except json.JSONDecodeError:
-            payload = {}
-
-        reward_text = await grant_chest_reward(
-            db,
-            user_id,
-            str(chest["chest_type"]),
-            payload,
-        )
-
-    try:
-        await callback.message.edit_text(
-            "🎁 <b>Сундук забран!</b>\n\n"
-            f"Игрок: <b>{display_name(callback.from_user)}</b>\n"
-            f"Награда: <b>{esc(reward_text)}</b>"
-        )
-    except Exception:
-        logger.exception("Ошибка изменения сообщения сундука")
-
-    await safe_callback_answer(
-        callback,
-        "Награда зачислена",
-    )
-
-
-@router.message(
-    lambda message: command_is(
-        message,
-        "фем",
-        "fem",
-        "foto",
-    )
-)
-async def fem_command(message: Message) -> None:
-    await ensure_user(message.from_user)
-
-    user_id = message.from_user.id
-    lock = get_user_fem_lock(user_id)
-
-    async with lock:
-        current_time = now_ts()
-
-        async with transaction() as db:
-            async with db.execute(
-                """
-                SELECT last_fem_time,
-                       custom_cd_hours,
-                       custom_cd_expires,
-                       cd_resets_count,
-                       cd_reset_expires,
-                       luck_expires,
-                       vip_until,
-                       attack_block_until
-                FROM users
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            ) as cursor:
-                user = await cursor.fetchone()
-
-            if not user:
-                await message.answer("Профиль не найден.")
-                return
-
-            attack_until = float(
-                user["attack_block_until"] or 0
-            )
-
-            if attack_until > current_time:
-                await message.answer(
-                    "🚫 Сбор карт временно запрещён.\n"
-                    f"Осталось: "
-                    f"<b>{short_time(attack_until - current_time)}</b>"
-                )
-                return
-
-            last_fem = float(user["last_fem_time"] or 0)
-            cooldown = await get_effective_fem_cooldown(
-                db,
-                user_id,
-                current_time,
-            )
-
-            elapsed = current_time - last_fem
-            skips = int(user["cd_resets_count"] or 0)
-            skip_expires = float(user["cd_reset_expires"] or 0)
-
-            if skip_expires <= current_time:
-                skips = 0
-
-            if elapsed < cooldown:
-                if skips > 0:
-                    await db.execute(
-                        """
-                        UPDATE users
-                        SET cd_resets_count = ?,
-                            cd_reset_expires = ?
-                        WHERE user_id = ?
-                        """,
-                        (
-                            skips - 1,
-                            skip_expires if skips > 1 else 0,
-                            user_id,
-                        ),
-                    )
-                else:
-                    await message.answer(
-                        "⏳ Рано.\n"
-                        f"До следующей попытки: "
-                        f"<b>{short_time(cooldown - elapsed)}</b>"
-                    )
-                    return
-
-            await db.execute(
-                """
-                UPDATE users
-                SET last_fem_time = ?
-                WHERE user_id = ?
-                """,
-                (current_time, user_id),
-            )
-
-            vip = float(user["vip_until"] or 0) > current_time
-            lucky = float(user["luck_expires"] or 0) > current_time
-
-        first_card = await draw_card(
-            user_id,
-            lucky=lucky,
-            vip=vip,
-        )
-
-        if not first_card:
-            await message.answer(
-                "😔 В базе пока нет доступных карт."
-            )
-            return
-
-        keyboard = await post_card_keyboard()
-
-        caption = format_card_caption(
-            int(first_card["id"]),
-            str(first_card["rarity"]),
-            str(first_card["description"]),
-            bool(first_card["duplicate"]),
-            int(first_card["compensation"]),
-        )
-
-        await message.answer_photo(
-            first_card["file_id"],
-            caption=caption,
-            reply_markup=keyboard,
-        )
-
-        if (
-            vip
-            and random.random() < 0.20
-        ):
-            second_card = await draw_card(
-                user_id,
-                lucky=lucky,
-                vip=vip,
-                force_duplicate=True,
-            )
-
-            if second_card:
-                second_caption = format_card_caption(
-                    int(second_card["id"]),
-                    str(second_card["rarity"]),
-                    str(second_card["description"]),
-                    True,
-                    int(second_card["compensation"]),
-                    prefix="👑 VIP-бонус: вторая карта",
-                )
-
-                await message.answer_photo(
-                    second_card["file_id"],
-                    caption=second_caption,
-                    reply_markup=keyboard,
-                )
-
-        if message.chat.type in {
-            ChatType.GROUP,
-            ChatType.SUPERGROUP,
-        }:
-            if random.random() < 0.10:
-                await send_group_chest(message.chat.id)
-
-
-@router.my_chat_member()
-async def bot_membership_handler(
-    event: types.ChatMemberUpdated,
-) -> None:
-    chat = event.chat
-
-    if chat.type not in {
-        ChatType.GROUP,
-        ChatType.SUPERGROUP,
-    }:
-        return
-
-    old_status = str(event.old_chat_member.status)
-    new_status = str(event.new_chat_member.status)
-
-    if new_status not in {"member", "administrator"}:
-        return
-
-    if old_status not in {"left", "kicked"}:
-        return
-
-    added_by = event.from_user
-
-    if not added_by:
-        return
-
-    try:
-        member_count = await bot.get_chat_member_count(chat.id)
-    except Exception:
-        logger.exception("Не удалось подтвердить размер группы")
-        return
-
-    if member_count < 15:
-        return
-
-    if member_count >= 2000:
-        reward = 500
-    elif member_count >= 500:
-        reward = 300
-    else:
-        reward = 50
-
-    user_id = added_by.id
-    await ensure_user(added_by)
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT reward_claimed
-            FROM group_rewards
-            WHERE chat_id = ?
-            """,
-            (chat.id,),
-        ) as cursor:
-            previous = await cursor.fetchone()
-
-        if previous and int(previous["reward_claimed"]) == 1:
-            return
-
-        async with db.execute(
-            """
-            SELECT count
-            FROM owner_group_counts
-            WHERE owner_id = ?
-            """,
-            (user_id,),
-        ) as cursor:
-            owner_row = await cursor.fetchone()
-
-        owner_count = int(owner_row["count"]) if owner_row else 0
-
-        if owner_count >= 3:
-            await db.execute(
-                """
-                INSERT INTO group_rewards(
-                    chat_id,
-                    owner_id,
-                    reward_claimed,
-                    member_count,
-                    rewarded_at
-                )
-                VALUES (?, ?, 1, ?, ?)
-                ON CONFLICT(chat_id) DO UPDATE SET
-                    reward_claimed = 1
-                """,
-                (
-                    chat.id,
-                    user_id,
-                    member_count,
-                    now_ts(),
-                ),
-            )
-            return
-
-        await db.execute(
-            """
-            UPDATE users
-            SET femcoins = femcoins + ?
-            WHERE user_id = ?
-            """,
-            (reward, user_id),
-        )
-
-        await db.execute(
-            """
-            INSERT INTO owner_group_counts(owner_id, count)
-            VALUES (?, 1)
-            ON CONFLICT(owner_id)
-            DO UPDATE SET count = count + 1
-            """,
-            (user_id,),
-        )
-
-        await db.execute(
-            """
-            INSERT INTO group_rewards(
-                chat_id,
-                owner_id,
-                reward_claimed,
-                member_count,
-                rewarded_at
-            )
-            VALUES (?, ?, 1, ?, ?)
-            """,
-            (
-                chat.id,
-                user_id,
-                member_count,
-                now_ts(),
-            ),
-        )
-
-    try:
-        await bot.send_message(
-            chat.id,
-            "🎉 <b>Спасибо за добавление бота!</b>\n"
-            f"Пользователю <b>{display_name(added_by)}</b> "
-            f"начислено <b>+{reward} 🪙</b>.\n"
-            f"Размер группы подтверждён: <b>{member_count}</b>.",
-        )
-    except Exception:
-        logger.exception("Ошибка уведомления о награде группы")
-
-
-def parse_interval(value: str) -> Optional[int]:
-    value = value.strip().lower()
-
-    try:
-        if value.endswith("m"):
-            seconds = int(value[:-1]) * 60
-        elif value.endswith("h"):
-            seconds = int(value[:-1]) * 3600
-        elif value.endswith("s"):
-            seconds = int(value[:-1])
-        else:
-            seconds = int(value)
-    except ValueError:
-        return None
-
-    return max(60, min(86400, seconds))
-
-
-@router.message(
-    lambda message: (
-        message.text
-        and (
-            normalize_command(message.text)
-            in {"/set_inactivity", "/интервал", "/интервал_сундука"}
-            or message.text.lower().startswith("интервал сундука")
-        )
-    )
-)
-async def set_inactivity_command(message: Message) -> None:
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-
-    if message.chat.type not in {
-        ChatType.GROUP,
-        ChatType.SUPERGROUP,
-    }:
-        await message.answer(
-            "Команду нужно использовать в группе."
-        )
-        return
-
-    parts = message.text.split()
-    value = parts[-1] if len(parts) > 1 else ""
-
-    seconds = parse_interval(value)
-
-    if seconds is None:
-        await message.answer(
-            "Формат: <code>/set_inactivity 30m</code>\n"
-            "Минимум — 60 секунд, максимум — 24 часа."
-        )
-        return
-
-    async with transaction() as db:
-        await db.execute(
-            """
-            INSERT INTO chats(
-                chat_id,
-                chat_type,
-                inactivity_interval,
-                last_activity
-            )
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-                inactivity_interval = excluded.inactivity_interval,
-                last_activity = excluded.last_activity
-            """,
-            (
-                message.chat.id,
-                message.chat.type,
-                seconds,
-                now_ts(),
-            ),
-        )
-
-    chat_activity_memory[message.chat.id] = now_ts()
-
-    await message.answer(
-        "✅ Интервал перекати-поля установлен: "
-        f"<b>{short_time(seconds)}</b>."
-    )
-
-
-async def inactivity_chest_worker() -> None:
-    while True:
-        try:
-            current_time = now_ts()
-
-            async with db_connection() as db:
-                async with db.execute(
-                    """
-                    SELECT chat_id,
-                           inactivity_interval,
-                           last_activity
-                    FROM chats
-                    WHERE chat_type IN ('group', 'supergroup')
-                    """
-                ) as cursor:
-                    chats = await cursor.fetchall()
-
-            for chat in chats:
-                chat_id = int(chat["chat_id"])
-
+        """, (streak, now, reward, uid))
+
+        if referred_by > 0 and ref_reward_given == 0:
+            has_act = await user_has_activity(uid)
+            if not has_act:
+                await db.execute("UPDATE users SET femcoins = femcoins + 25 WHERE user_id = ?", (referred_by,))
+                await db.execute("UPDATE users SET referral_reward_given = 1 WHERE user_id = ?", (uid,))
                 try:
-                    member_count = await bot.get_chat_member_count(
-                        chat_id
+                    ref_name = await get_user_display_name(uid, clean=True)
+                    await bot.send_message(
+                        referred_by,
+                        f"👥 <b>Реферальный бонус!</b>\n"
+                        f"Приглашенный вами новый игрок <b>{ref_name}</b> забрал свой первый дейлик!\n"
+                        f"Вам начислено <b>+25 🪙 фемкоинов</b>!"
                     )
                 except Exception:
-                    logger.warning(
-                        "Не подтверждён размер группы %s",
-                        chat_id,
-                    )
-                    continue
+                    pass
+            else:
+                await db.execute("UPDATE users SET referral_reward_given = 2 WHERE user_id = ?", (uid,))
 
-                if member_count < 30:
-                    continue
+        await db.commit()
 
-                last_activity = float(
-                    chat_activity_memory.get(
-                        chat_id,
-                        chat["last_activity"] or 0,
-                    )
-                )
+    await message.reply(
+        f"📅 <b>Ежедневная награда получена!</b>\n\n"
+        f"🔥 <b>Ваша текущая серия:</b> {streak} дн.\n"
+        f"💰 <b>Начислено:</b> +{reward} 🪙 фемкоинов!"
+        f"{f' (включая +5 🪙 VIP-бонус)' if vip_active else ''}\n"
+        f"<i>Не пропускайте дни, чтобы увеличивать бонус!</i>"
+    )
 
-                interval = max(
-                    60,
-                    min(
-                        86400,
-                        int(chat["inactivity_interval"] or 3600),
-                    ),
-                )
+# ----------------- ПЕРЕКАТИ-ПОЛЕ И ИНТЕРВАЛ -----------------
+def is_set_inactivity_cmd(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    clean = text.strip().lower()
+    first = clean.split()[0].replace("/", "").split("@")[0]
+    return first in ["set_inactivity", "интервал_сундука"] or clean.startswith("интервал сундука") or first == "интервал"
 
-                if (
-                    last_activity > 0
-                    and current_time - last_activity >= interval
-                ):
-                    async with transaction() as db:
-                        await db.execute(
-                            """
-                            UPDATE chats
-                            SET last_activity = ?,
-                                last_chest_at = ?
-                            WHERE chat_id = ?
-                            """,
-                            (
-                                current_time,
-                                current_time,
-                                chat_id,
-                            ),
-                        )
+@dp.message(lambda msg: is_set_inactivity_cmd(msg.text))
+async def set_inactivity_interval_cmd(message: Message):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+    if message.chat.type not in ["group", "supergroup"]:
+        return await message.reply("❌ Эту команду нужно использовать прямо в целевой группе!")
 
-                    chat_activity_memory[chat_id] = current_time
+    parts = message.text.strip().split()
+    val_str = ""
+    for p in parts[1:]:
+        if p.lower() != "сундука":
+            val_str = p.lower()
+            break
 
-                    chest_type = "normal"
-                    payload = {
-                        "coins": random.choices(
-                            [20, 35, 50, 75, 120],
-                            weights=[45, 25, 18, 8, 4],
-                            k=1,
-                        )[0]
+    if not val_str:
+        return await message.reply(
+            "❗ <b>Укажите интервал времени!</b>\n\n"
+            "Примеры:\n"
+            "• <code>/set_inactivity 30m</code> (30 минут)\n"
+            "• <code>/set_inactivity 2h</code> (2 часа)\n"
+            "• <code>/set_inactivity 3600</code> (3600 секунд)"
+        )
+
+    seconds = 3600
+    try:
+        if val_str.endswith("m"):
+            seconds = int(val_str.replace("m", "")) * 60
+        elif val_str.endswith("h"):
+            seconds = int(val_str.replace("h", "")) * 3600
+        elif val_str.endswith("s"):
+            seconds = int(val_str.replace("s", ""))
+        else:
+            seconds = int(val_str)
+    except Exception:
+        return await message.reply("❌ Неверный формат времени!")
+
+    seconds = max(60, min(86400, seconds))
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            INSERT INTO chats (chat_id, chat_type, inactivity_interval)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET inactivity_interval = excluded.inactivity_interval
+        """, (message.chat.id, message.chat.type, seconds))
+        await db.commit()
+
+    chat_last_activity[message.chat.id] = time.time()
+    await message.reply(f"✅ Интервал появления перекати-поля в этом чате успешно установлен: <b>{seconds // 60} мин.</b> ({seconds} сек.)!")
+
+async def inactivity_chest_task():
+    await asyncio.sleep(10)
+    while True:
+        try:
+            now = time.time()
+            async with aiosqlite.connect(DB_NAME) as db:
+                async with db.execute("SELECT chat_id, inactivity_interval FROM chats WHERE chat_type IN ('group', 'supergroup')") as cur:
+                    chats = await cur.fetchall()
+
+            for chat_id, interval in chats:
+                try:
+                    member_count = await bot.get_chat_member_count(chat_id)
+                    if member_count < 30:
+                        continue
+                except Exception:
+                    pass
+
+                last_act = chat_last_activity.get(chat_id, 0)
+                inv = interval if (interval and interval > 0) else 3600
+                
+                if last_act > 0 and (now - last_act >= inv):
+                    chat_last_activity[chat_id] = now
+
+                    chest_id = f"ch_idle_{int(now)}_{random.randint(100, 999)}"
+                    reward_coins = random.choices([20, 35, 50, 75, 120], weights=[45, 25, 18, 8, 4])[0]
+                    active_chests[chest_id] = {
+                        "type": "normal",
+                        "coins": reward_coins,
+                        "claimed": False,
+                        "winner_name": None
                     }
 
-                    chest_id = await create_chest(
-                        chat_id,
-                        chest_type,
-                        payload,
-                    )
-
+                    chest_kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🎁 Забрать сундук!", callback_data=f"claim_chest_{chest_id}")]
+                    ])
                     try:
                         await bot.send_message(
                             chat_id,
-                            "🌵 <b>Перекати-поле!</b>\n"
-                            "В чате было тихо, и появился сундук.",
-                            reply_markup=chest_keyboard(chest_id),
+                            "🌵 <b>В чате тихо... Тут прокатилось перекати-поле и оставило сундук!</b>\n"
+                            "<i>Кто первый нажмет на кнопку, заберет сокровища за простой чата!</i>",
+                            reply_markup=chest_kb
                         )
                     except Exception:
-                        logger.exception(
-                            "Ошибка отправки сундука тишины"
-                        )
-
-        except Exception:
-            logger.exception("Ошибка worker перекати-поля")
+                        pass
+        except Exception as e:
+            logger.error(f"Inactivity chest error: {e}")
 
         await asyncio.sleep(60)
 
-
-def golden_rain_command_data(
-    message: Message,
-) -> tuple[int, float]:
-    parts = (message.text or "").split()
-
-    count = 10
-    interval = 3.0
-
-    numeric = [
-        part.replace(",", ".")
-        for part in parts[1:]
-    ]
-
-    if numeric:
-        try:
-            count = int(float(numeric[0]))
-        except ValueError:
-            pass
-
-    if len(numeric) > 1:
-        try:
-            interval = float(numeric[1])
-        except ValueError:
-            pass
-
-    count = max(1, min(50, count))
-    interval = max(1.0, interval)
-
-    return count, interval
-
-
-@router.message(
-    lambda message: (
-        message.text
-        and message.text.lower().strip().split()[0]
-        in {
-            "золотой",
-            "/golden_rain",
-            "golden_rain",
-            "золотой_дождь",
-            "/золотой_дождь",
-        }
-    )
-)
-async def golden_rain_command(message: Message) -> None:
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-
-    if message.chat.type not in {
-        ChatType.GROUP,
-        ChatType.SUPERGROUP,
-    }:
-        await message.answer(
-            "Золотой дождь запускается только в группе."
-        )
-        return
-
-    text = (message.text or "").lower()
-
-    if not (
-        "золотой дождь" in text
-        or "золотой_дождь" in text
-        or "golden_rain" in text
-    ):
-        return
-
-    count, interval = golden_rain_command_data(message)
-
-    await message.answer(
-        "🌧 <b>Золотой дождь начинается!</b>\n"
-        f"Сундуков: <b>{count}</b>\n"
-        f"Интервал: <b>{interval:g} сек.</b>"
-    )
-
-    task = asyncio.create_task(
-        golden_rain_worker(
-            message.chat.id,
-            count,
-            interval,
-        )
-    )
-
-    active_tasks.add(task)
-    task.add_done_callback(active_tasks.discard)
-
-
-async def golden_rain_worker(
-    chat_id: int,
-    count: int,
-    interval: float,
-) -> None:
-    legendary_count = 2 if count == 50 else (
-        1 if 10 <= count <= 49 else 0
-    )
-
-    legendary_positions = set(
-        random.sample(
-            range(count),
-            legendary_count,
-        )
-    ) if legendary_count else set()
-
-    for index in range(count):
-        await asyncio.sleep(interval)
-
-        if index in legendary_positions:
-            chest_type = "legendary"
-            payload = {
-                "coins": 250,
-                "golden_rain": True,
-            }
-            title = "🌟 <b>Легендарный сундук!</b>"
-        elif random.random() < 0.25:
-            chest_type = "rare"
-            payload = {
-                "coins": random.randint(50, 100),
-                "golden_rain": True,
-            }
-            title = "💎 <b>Редкий сундук!</b>"
-        else:
-            chest_type = "normal"
-            payload = {
-                "coins": random.randint(3, 15),
-                "golden_rain": True,
-            }
-            title = "📦 <b>Обычный сундук!</b>"
-
-        chest_id = await create_chest(
-            chat_id,
-            chest_type,
-            payload,
-            lifetime=1800,
-        )
-
-        try:
-            await bot.send_message(
-                chat_id,
-                f"{title}\n"
-                f"Сундук {index + 1}/{count}.",
-                reply_markup=chest_keyboard(chest_id),
-            )
-        except Exception:
-            logger.exception(
-                "Ошибка отправки сундука золотого дождя"
-            )
-
-# =========================
-# BLOCK 5/5 — АРТЕФАКТЫ, ТРЕЙД, АДМИНИСТРИРОВАНИЕ
-# =========================
-
-def artifact_amount(
-    row: Optional[aiosqlite.Row],
-) -> int:
-    return int(row["amount"] or 0) if row else 0
-
-
-async def add_artifact(
-    db: aiosqlite.Connection,
-    user_id: int,
-    artifact_type: str,
-    subtype: str = "",
-    amount: int = 1,
-) -> None:
-    await db.execute(
-        """
-        INSERT INTO artifacts(
-            user_id, artifact_type, subtype,
-            amount, created_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, artifact_type, subtype)
-        DO UPDATE SET amount = amount + excluded.amount
-        """,
-        (
-            user_id,
-            artifact_type,
-            subtype,
-            amount,
-            now_ts(),
-        ),
-    )
-
-
-async def get_artifact_count(
-    user_id: int,
-    artifact_type: str,
-    subtype: str = "",
-) -> int:
-    async with db_connection() as db:
-        async with db.execute(
-            """
-            SELECT amount
-            FROM artifacts
-            WHERE user_id = ?
-              AND artifact_type = ?
-              AND subtype = ?
-            """,
-            (user_id, artifact_type, subtype),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-    return artifact_amount(row)
-
-
-async def show_artifacts(
-    message: Message,
-    artifact_type: Optional[str] = None,
-) -> None:
-    await ensure_user(message.from_user)
-
-    user_id = message.from_user.id
-
-    async with db_connection() as db:
-        if artifact_type:
-            async with db.execute(
-                """
-                SELECT artifact_type, subtype, amount,
-                       hidden_amount, blocked_until
-                FROM artifacts
-                WHERE user_id = ?
-                  AND artifact_type = ?
-                ORDER BY artifact_type, subtype
-                """,
-                (user_id, artifact_type),
-            ) as cursor:
-                rows = await cursor.fetchall()
-        else:
-            async with db.execute(
-                """
-                SELECT artifact_type, subtype, amount,
-                       hidden_amount, blocked_until
-                FROM artifacts
-                WHERE user_id = ?
-                ORDER BY artifact_type, subtype
-                """,
-                (user_id,),
-            ) as cursor:
-                rows = await cursor.fetchall()
-
-    names = {
-        "blade": "🗡 Клинки",
-        "armor": "🛡 Броня",
-        "shield": "🔰 Щиты",
-    }
-
-    subtype_names = {
-        "weak": "слабый",
-        "reinforced": "усиленный",
-        "femboy": "фембойский",
-        "": "",
-    }
-
-    lines = [
-        f"<b>{names.get(artifact_type, 'Артефакты')}</b>",
-        "",
-    ]
-
-    for row in rows:
-        amount = int(row["amount"] or 0)
-
-        if amount <= 0:
-            continue
-
-        subtype = subtype_names.get(
-            str(row["subtype"] or ""),
-            str(row["subtype"] or ""),
-        )
-
-        title = (
-            f"{subtype} "
-            f"{names.get(str(row['artifact_type']), str(row['artifact_type']))}"
-        ).strip()
-
-        lines.append(f"• {esc(title)}: <b>{amount}</b>")
-
-        blocked = float(row["blocked_until"] or 0)
-
-        if blocked > now_ts():
-            lines.append(
-                f"  Заблокировано ещё "
-                f"{short_time(blocked - now_ts())}"
-            )
-
-    if len(lines) == 2:
-        lines.append("Пока ничего нет.")
-
-    await message.answer("\n".join(lines))
-
-
-@router.message(
-    lambda message: command_is(message, "мои клинки")
-)
-async def my_blades_command(message: Message) -> None:
-    await show_artifacts(message, "blade")
-
-
-@router.message(
-    lambda message: command_is(message, "моя броня")
-)
-async def my_armor_command(message: Message) -> None:
-    await show_artifacts(message, "armor")
-
-
-@router.message(
-    lambda message: command_is(message, "мои щиты")
-)
-async def my_shields_command(message: Message) -> None:
-    await show_artifacts(message, "shield")
-
-
-async def craft_shield(
-    user_id: int,
-    source: str,
-    target: str,
-) -> bool:
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT amount
-            FROM artifacts
-            WHERE user_id = ?
-              AND artifact_type = 'shield'
-              AND subtype = ?
-            """,
-            (user_id, source),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        if not row or int(row["amount"] or 0) < 3:
-            return False
-
-        await db.execute(
-            """
-            UPDATE artifacts
-            SET amount = amount - 3
-            WHERE user_id = ?
-              AND artifact_type = 'shield'
-              AND subtype = ?
-              AND amount >= 3
-            """,
-            (user_id, source),
-        )
-
-        await add_artifact(
-            db,
-            user_id,
-            "shield" if target != "armor" else "armor",
-            "" if target == "armor" else target,
-            1,
-        )
-
-    return True
-
-
-@router.message(
-    lambda message: command_is(message, "крафт щитов")
-)
-async def shield_craft_command(message: Message) -> None:
-    user_id = message.from_user.id
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="3 слабых → усиленный",
-                    callback_data="shieldcraft:weak",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="3 усиленных → фембойский",
-                    callback_data="shieldcraft:reinforced",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="3 фембойских → броня",
-                    callback_data="shieldcraft:femboy",
-                )
-            ],
-        ]
-    )
-
-    await message.answer(
-        "⚒ <b>Крафт щитов</b>\n"
-        "Крафт выполняется атомарно.",
-        reply_markup=keyboard,
-    )
-
-
-@router.callback_query(F.data.startswith("shieldcraft:"))
-async def shield_craft_callback(
-    callback: CallbackQuery,
-) -> None:
-    source = parse_callback(
-        callback.data or "",
-        "shieldcraft:",
-    )
-
-    targets = {
-        "weak": "reinforced",
-        "reinforced": "femboy",
-        "femboy": "armor",
-    }
-
-    target = targets.get(source or "")
-
-    if not target:
-        await safe_callback_answer(
-            callback,
-            "Некорректный крафт",
-            show_alert=True,
-        )
-        return
-
-    success = await craft_shield(
-        callback.from_user.id,
-        source,
-        target,
-    )
-
-    if not success:
-        await safe_callback_answer(
-            callback,
-            "Нужно 3 предмета одного типа",
-            show_alert=True,
-        )
-        return
-
-    await safe_callback_answer(
-        callback,
-        "Крафт успешно выполнен",
-        show_alert=True,
-    )
-
-
-@router.message(
-    lambda message: command_is(message, "крафт")
-)
-async def card_craft_command(message: Message) -> None:
-    user_id = message.from_user.id
-
-    async with db_connection() as db:
-        async with db.execute(
-            """
-            SELECT c.rarity,
-                   SUM(i.count - 1) AS duplicates
-            FROM inventory AS i
-            JOIN cards AS c ON c.id = i.card_id
-            WHERE i.user_id = ?
-              AND i.count > 1
-            GROUP BY c.rarity
-            HAVING duplicates >= 3
-            """,
-            (user_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-
-    buttons = []
-
-    for row in rows:
-        rarity = str(row["rarity"])
-
-        if RARITY_ORDER.get(rarity, -1) >= len(RARITIES) - 1:
-            continue
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=(
-                        f"{rarity} "
-                        f"(дубликатов: {int(row['duplicates'])})"
-                    ),
-                    callback_data=f"cardcraft:{rarity}",
-                )
-            ]
-        )
-
-    if not buttons:
-        await message.answer(
-            "❌ Для крафта нужны 3 свободных дубликата "
-            "одной редкости."
-        )
-        return
-
-    await message.answer(
-        "⚒ <b>Крафт карт</b>\n"
-        "Основная копия карты не расходуется.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
-    )
-
-
-@router.callback_query(F.data.startswith("cardcraft:"))
-async def card_craft_callback(
-    callback: CallbackQuery,
-) -> None:
-    rarity = parse_callback(
-        callback.data or "",
-        "cardcraft:",
-    )
-
-    if not rarity or rarity not in RARITY_ORDER:
-        await safe_callback_answer(
-            callback,
-            "Некорректная редкость",
-            show_alert=True,
-        )
-        return
-
-    index = RARITY_ORDER[rarity]
-
-    if index + 1 >= len(RARITIES):
-        await safe_callback_answer(
-            callback,
-            "Следующей редкости нет",
-            show_alert=True,
-        )
-        return
-
-    target_rarity = RARITIES[index + 1]
-    user_id = callback.from_user.id
-
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT i.id, i.count
-            FROM inventory AS i
-            JOIN cards AS c ON c.id = i.card_id
-            WHERE i.user_id = ?
-              AND c.rarity = ?
-              AND i.count > 1
-            """,
-            (user_id, rarity),
-        ) as cursor:
-            rows = await cursor.fetchall()
-
-        available = sum(
-            max(0, int(row["count"]) - 1)
-            for row in rows
-        )
-
-        if available < 3:
-            await safe_callback_answer(
-                callback,
-                "Недостаточно дубликатов",
-                show_alert=True,
-            )
-            return
-
-        target = None
-
-        async with db.execute(
-            """
-            SELECT id, file_id, description
-            FROM cards
-            WHERE rarity = ?
-            ORDER BY RANDOM()
-            LIMIT 1
-            """,
-            (target_rarity,),
-        ) as cursor:
-            target = await cursor.fetchone()
-
-        if not target:
-            await safe_callback_answer(
-                callback,
-                "Карт следующей редкости пока нет",
-                show_alert=True,
-            )
-            return
-
-        left = 3
-
-        for row in rows:
-            available_here = int(row["count"]) - 1
-            take = min(left, available_here)
-
-            await db.execute(
-                """
-                UPDATE inventory
-                SET count = count - ?
-                WHERE id = ?
-                  AND count - 1 >= ?
-                """,
-                (take, int(row["id"]), take),
-            )
-
-            left -= take
-
-            if left == 0:
+@dp.message(lambda msg: msg.text and any(get_normalized_command(msg.text) == p or msg.text.lower().strip().startswith(p) for p in ["передать", "перевод", "/pay", "/transfer", "дать"]))
+async def transfer_coins_cmd(message: Message):
+    await disqualify_referral(message.from_user.id)
+    sender_id = message.from_user.id
+    parts = message.text.strip().split()
+
+    amount: Optional[int] = None
+    target_id: Optional[int] = None
+
+    for p in parts[1:]:
+        if p.isdigit():
+            amount = int(p)
+            break
+
+    if not amount or amount <= 0:
+        return await message.reply("❗ Укажите сумму для передачи!\nПример: <code>передать 100</code> (ответом на сообщение) или <code>передать @username 100</code>")
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target_id = message.reply_to_message.from_user.id
+    else:
+        for p in parts[1:]:
+            if p.startswith("@"):
+                uname = p.lstrip("@")
+                async with aiosqlite.connect(DB_NAME) as db:
+                    async with db.execute("SELECT user_id FROM users WHERE username = ? OR username = ?", (uname, f"@{uname}")) as cur:
+                        row = await cur.fetchone()
+                        if row:
+                            target_id = row[0]
                 break
 
-        if index >= RARITY_ORDER["Легендарное"]:
-            success = random.random() < 0.35
+    if not target_id:
+        return await message.reply("❗ Укажите получателя ответом на его сообщение или тегом @username!")
+
+    if target_id == sender_id:
+        return await message.reply("❌ Нельзя переводить фемкоины самому себе!")
+
+    vip_sender = await is_vip(sender_id)
+    COMMISSION_PERCENT = 5 if vip_sender else 10
+    burned = max(1, int(amount * COMMISSION_PERCENT / 100))
+    received = amount - burned
+
+    if received <= 0:
+        return await message.reply("❌ Сумма слишком мала для передачи с учетом комиссии!")
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT femcoins FROM users WHERE user_id = ?", (sender_id,)) as cur:
+            s_row = await cur.fetchone()
+            sender_coins = s_row[0] if s_row else 0
+
+        if sender_coins < amount:
+            return await message.reply(f"❌ Недостаточно фемкоинов! Ваш баланс: {sender_coins} 🪙, а нужно: {amount} 🪙.")
+
+        await db.execute("UPDATE users SET femcoins = femcoins - ? WHERE user_id = ?", (amount, sender_id))
+        await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (received, target_id))
+        await db.commit()
+
+    sender_name = await get_user_display_name(sender_id, clean=True)
+    target_name = await get_user_display_name(target_id, clean=True)
+
+    await message.reply(
+        f"💸 <b>Успешный перевод фемкоинов!</b>\n\n"
+        f"👤 Отправитель: <b>{sender_name}</b>\n"
+        f"🎯 Получатель: <b>{target_name}</b>\n"
+        f"💰 Отправлено: <b>{amount} 🪙</b>\n"
+        f"📥 Получено: <b>+{received} 🪙</b>\n"
+        f"🔥 Комиссия (сгорело): <b>{burned} 🪙</b> ({COMMISSION_PERCENT}%)"
+    )
+
+@dp.message(lambda msg: match_command(msg, ["profil", "profile", "профиль"]))
+async def profile_command(message: Message):
+    await disqualify_referral(message.from_user.id)
+    await show_user_profile(message.chat.id, message.from_user, reply_to=message.message_id)
+
+async def show_user_profile(chat_id: int, user: types.User, reply_to: int = None):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(DISTINCT card_id) FROM inventory WHERE user_id = ?", (user.id,)) as cur:
+            user_cards_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM cards") as cur:
+            total_cards = (await cur.fetchone())[0]
+        async with db.execute("SELECT femcoins, cd_resets_count, cd_reset_expires, vip_until FROM users WHERE user_id = ?", (user.id,)) as cur:
+            row = await cur.fetchone()
+            coins = row[0] if row else 100
+            cd_resets = row[1] if row else 0
+            cd_reset_exp = row[2] if row else 0
+            vip_until = row[3] if row else 0
+
+    now = time.time()
+    skip_str = ""
+    if cd_resets > 0:
+        if cd_reset_exp > now:
+            rem_sec = int(cd_reset_exp - now)
+            rem_h = rem_sec // 3600
+            rem_m = (rem_sec % 3600) // 60
+            skip_str = f"\n⚡ <b>Скипы КД:</b> {cd_resets} шт. (действуют еще {rem_h}ч {rem_m}м)"
         else:
-            success = True
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute("UPDATE users SET cd_resets_count = 0, cd_reset_expires = 0 WHERE user_id = ?", (user.id,))
+                await db.commit()
 
-        if not success:
-            reward = random.choices(
-                [50, 100, 150, 200, 350],
-                weights=[40, 25, 18, 12, 5],
-                k=1,
-            )[0]
+    vip_str = ""
+    if vip_until > now:
+        vip_dt = datetime.fromtimestamp(vip_until).strftime("%d.%m.%Y в %H:%M")
+        vip_str = f"\n👑 <b>VIP-статус:</b> активен до {vip_dt}"
 
-            await db.execute(
-                """
-                UPDATE users
-                SET femcoins = femcoins + ?
-                WHERE user_id = ?
-                """,
-                (reward, user_id),
-            )
-
-            result = (
-                "💥 <b>Крафт не удался.</b>\n"
-                f"Компенсация: <b>+{reward} 🪙</b>"
-            )
-        else:
-            await db.execute(
-                """
-                INSERT INTO inventory(user_id, card_id, count)
-                VALUES (?, ?, 1)
-                ON CONFLICT(user_id, card_id)
-                DO UPDATE SET count = count + 1
-                """,
-                (user_id, int(target["id"])),
-            )
-
-            result = (
-                "🎉 <b>Крафт успешен!</b>\n"
-                f"Получена карта #{int(target['id'])}\n"
-                f"Редкость: <b>{esc(target_rarity)}</b>"
-            )
-
-    await callback.message.answer(result)
-    await safe_callback_answer(callback)
-
-
-def trade_keyboard(trade_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Принять обмен",
-                    callback_data=f"trade_accept:{trade_id}",
-                )
-            ]
-        ]
+    photos = await bot.get_user_profile_photos(user.id, limit=1)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🖼 Смотреть все фото", callback_data=f"viewcards_{user.id}_0")]
+    ])
+    u_display = user.username or user.full_name
+    caption = (
+        f"👤 <b>Профиль игрока:</b> {u_display}\n"
+        f"💰 <b>Фемкоины:</b> {coins} 🪙"
+        f"{vip_str}"
+        f"\n🎴 <b>Собрано карт:</b> {user_cards_count} из {total_cards}"
+        f"{skip_str}"
     )
 
+    if photos.total_count > 0:
+        await bot.send_photo(chat_id, photos.photos[0][-1].file_id, caption=caption, reply_markup=kb, reply_to_message_id=reply_to)
+    else:
+        await bot.send_message(chat_id, caption, reply_markup=kb, reply_to_message_id=reply_to)
 
-@router.message(
-    lambda message: command_is(
-        message,
-        "трейд",
-        "trade",
-    )
-)
-async def trade_start_command(message: Message) -> None:
-    if not message.reply_to_message:
-        await message.answer(
-            "Команда должна быть ответом на сообщение игрока."
-        )
-        return
+@dp.callback_query(F.data.startswith("viewcards_"))
+async def browse_cards(callback: CallbackQuery):
+    _, uid_str, idx_str = callback.data.split("_")
+    uid = int(uid_str)
+    idx = int(idx_str)
 
-    target = message.reply_to_message.from_user
-    sender = message.from_user
+    if callback.from_user.id != uid:
+        return await callback.answer("Это не ваш профиль!", show_alert=True)
 
-    if not target or target.is_bot or target.id == sender.id:
-        await message.answer(
-            "❌ Нельзя торговать с собой или ботом."
-        )
-        return
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT c.id, c.file_id, c.rarity, c.description, inv.count
+            FROM inventory inv
+            JOIN cards c ON inv.card_id = c.id
+            WHERE inv.user_id = ?
+        """, (uid,)) as cur:
+            cards = await cur.fetchall()
 
-    await ensure_user(sender)
-    await ensure_user(target)
+    if not cards:
+        return await callback.answer("У вас ещё нет карт!", show_alert=True)
 
-    trade_id = secrets.token_urlsafe(12)
+    cards.sort(key=lambda x: RARITY_ORDER.get(x[2], 0), reverse=True)
+    idx = max(0, min(idx, len(cards) - 1))
+    c_id, f_id, rarity, desc, cnt = cards[idx]
 
-    async with transaction() as db:
-        await db.execute(
-            """
-            INSERT INTO trades(
-                trade_id, p1, p2, created_at, updated_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                trade_id,
-                sender.id,
-                target.id,
-                now_ts(),
-                now_ts(),
-            ),
-        )
+    nav_btns = []
+    if idx > 0:
+        nav_btns.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"viewcards_{uid}_{idx-1}"))
+    if idx < len(cards) - 1:
+        nav_btns.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"viewcards_{uid}_{idx+1}"))
 
-    await message.answer(
-        "🤝 <b>Предложение обмена</b>\n\n"
-        f"От: {display_name(sender)}\n"
-        f"Кому: {display_name(target)}\n\n"
-        "Оба игрока должны выбрать по одному дубликату "
-        "одинаковой редкости.",
-        reply_markup=trade_keyboard(trade_id),
+    kb = InlineKeyboardMarkup(inline_keyboard=[nav_btns] if nav_btns else [])
+
+    text = (
+        f"🎴 <b>Карта #{c_id}</b> ({idx+1}/{len(cards)})\n"
+        f"🌟 <b>Редкость:</b> {rarity}\n"
+        f"🔢 <b>Количество дубликатов у вас:</b> {cnt}\n"
+        f"📝 <b>Описание:</b> {desc or 'Без описания'}"
     )
 
-
-@router.callback_query(F.data.startswith("trade_accept:"))
-async def trade_accept_callback(
-    callback: CallbackQuery,
-) -> None:
-    trade_id = parse_callback(
-        callback.data or "",
-        "trade_accept:",
-    )
-
-    if not trade_id:
-        await safe_callback_answer(
-            callback,
-            "Некорректная сделка",
-            show_alert=True,
+    try:
+        await callback.message.edit_media(
+            media=InputMediaPhoto(media=f_id, caption=text),
+            reply_markup=kb,
         )
-        return
+    except Exception:
+        await callback.message.delete()
+        await callback.message.answer_photo(photo=f_id, caption=text, reply_markup=kb)
+    await callback.answer()
 
-    async with db_connection() as db:
-        async with db.execute(
-            """
-            SELECT p1, p2, status
-            FROM trades
-            WHERE trade_id = ?
-            """,
-            (trade_id,),
-        ) as cursor:
-            trade = await cursor.fetchone()
+@dp.message(lambda msg: match_command(msg, ["admin", "кто админ"]))
+async def who_admin(message: Message):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT value FROM settings WHERE key = 'admin_info'") as cur:
+            row = await cur.fetchone()
+    text = row[0] if row else "Администратор ещё не настроил информацию о себе."
+    await message.reply(text)
 
-    if not trade:
-        await safe_callback_answer(
-            callback,
-            "Сделка не найдена",
-            show_alert=True,
-        )
-        return
+@dp.message(lambda msg: match_command(msg, ["craft", "крафт"]))
+async def craft_command(message: Message):
+    await disqualify_referral(message.from_user.id)
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT c.rarity, SUM(inv.count - 1) as total_dups
+            FROM inventory inv
+            JOIN cards c ON inv.card_id = c.id
+            WHERE inv.user_id = ? AND inv.count > 1
+            GROUP BY c.rarity
+            HAVING total_dups >= 3
+        """, (uid,)) as cur:
+            avail = await cur.fetchall()
 
-    if callback.from_user.id != int(trade["p2"]):
-        await safe_callback_answer(
-            callback,
-            "Это предложение не вам",
-            show_alert=True,
-        )
-        return
-
-    if trade["status"] != "pending":
-        await safe_callback_answer(
-            callback,
-            "Сделка уже закрыта",
-            show_alert=True,
-        )
-        return
-
-    async with transaction() as db:
-        await db.execute(
-            """
-            UPDATE trades
-            SET status = 'active',
-                updated_at = ?
-            WHERE trade_id = ?
-              AND status = 'pending'
-            """,
-            (now_ts(), trade_id),
-        )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Выбрать карту",
-                    callback_data=f"trade_pick:{trade_id}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✅ Подтвердить",
-                    callback_data=f"trade_confirm:{trade_id}",
-                )
-            ],
-        ]
-    )
-
-    await safe_edit_text(
-        callback.message,
-        "🔄 <b>Обмен открыт.</b>\n"
-        "Каждый участник выбирает один дубликат.",
-        keyboard,
-    )
-    await safe_callback_answer(callback)
-
-
-@router.callback_query(F.data.startswith("trade_pick:"))
-async def trade_pick_callback(
-    callback: CallbackQuery,
-) -> None:
-    trade_id = parse_callback(
-        callback.data or "",
-        "trade_pick:",
-    )
-
-    async with db_connection() as db:
-        async with db.execute(
-            """
-            SELECT p1, p2, status
-            FROM trades
-            WHERE trade_id = ?
-            """,
-            (trade_id,),
-        ) as cursor:
-            trade = await cursor.fetchone()
-
-        if not trade:
-            await safe_callback_answer(
-                callback,
-                "Сделка не найдена",
-                show_alert=True,
-            )
-            return
-
-        user_id = callback.from_user.id
-
-        if user_id not in {
-            int(trade["p1"]),
-            int(trade["p2"]),
-        }:
-            await safe_callback_answer(
-                callback,
-                "Вы не участник сделки",
-                show_alert=True,
-            )
-            return
-
-        async with db.execute(
-            """
-            SELECT c.id, c.rarity, i.count
-            FROM inventory AS i
-            JOIN cards AS c ON c.id = i.card_id
-            WHERE i.user_id = ?
-              AND i.count > 1
-            ORDER BY c.id
-            """,
-            (user_id,),
-        ) as cursor:
-            cards = await cursor.fetchall()
+    if not avail:
+        return await message.reply("❌ Для крафта нужно минимум 3 свободных дубликата одной редкости! Основные карты не тратятся.")
 
     buttons = [
-        [
-            InlineKeyboardButton(
-                text=(
-                    f"#{int(row['id'])} "
-                    f"{row['rarity']} x{int(row['count'])}"
-                ),
-                callback_data=(
-                    f"trade_set:{trade_id}:{int(row['id'])}"
-                ),
-            )
-        ]
-        for row in cards
+        [InlineKeyboardButton(text=f"{r} (Доступно дубликатов: {cnt})", callback_data=f"do_craft_{r}")]
+        for r, cnt in avail if RARITY_ORDER.get(r, 0) < len(RARITIES) - 1
     ]
-
     if not buttons:
-        await safe_callback_answer(
-            callback,
-            "Нет доступных дубликатов",
-            show_alert=True,
-        )
-        return
+        return await message.reply("❌ У вас есть дубликаты только максимальной редкости, их нельзя улучшить!")
 
-    await callback.message.answer(
-        "Выберите карту для обмена:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        ),
+    await message.reply("⚒ <b>Выберите редкость дубликатов для скрещивания 3-в-1</b>\n<i>(Основные карты в коллекции защищены и не тратятся):</i>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("do_craft_"))
+async def execute_craft(callback: CallbackQuery):
+    rarity = callback.data.replace("do_craft_", "")
+    uid = callback.from_user.id
+    current_idx = RARITY_ORDER.get(rarity, 0)
+    target_rarity = RARITIES[current_idx + 1]
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT inv.id, inv.count 
+            FROM inventory inv
+            JOIN cards c ON inv.card_id = c.id
+            WHERE inv.user_id = ? AND c.rarity = ? AND inv.count > 1
+        """, (uid, rarity)) as cur:
+            rows = await cur.fetchall()
+
+        needed = 3
+        for inv_id, count in rows:
+            available_dups = count - 1
+            take = min(needed, available_dups)
+            await db.execute("UPDATE inventory SET count = count - ? WHERE id = ?", (take, inv_id))
+            needed -= take
+            if needed == 0:
+                break
+
+        if needed > 0:
+            return await callback.answer("Недостаточно дубликатов для крафта!", show_alert=True)
+
+        is_lottery = current_idx >= RARITY_ORDER["Легендарное"]
+        success = True
+        lottery_coins = 0
+        if is_lottery:
+            if random.random() > 0.35:
+                success = False
+                lottery_coins = random.choices([50, 100, 150, 200, 350], weights=[40, 25, 18, 12, 5])[0]
+                await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (lottery_coins, uid))
+
+        if success:
+            async with db.execute("SELECT id, file_id, description FROM cards WHERE rarity = ? ORDER BY RANDOM() LIMIT 1", (target_rarity,)) as cur:
+                new_card = await cur.fetchone()
+            if not new_card:
+                await db.rollback()
+                return await callback.message.edit_text(f"❌ В базе пока нет карт ранга {target_rarity}! Карты не были списаны.")
+
+            c_id, f_id, desc = new_card
+            async with db.execute("SELECT id FROM inventory WHERE user_id = ? AND card_id = ?", (uid, c_id)) as cur:
+                exists = await cur.fetchone()
+                if exists:
+                    await db.execute("UPDATE inventory SET count = count + 1 WHERE id = ?", (exists[0],))
+                else:
+                    await db.execute("INSERT INTO inventory (user_id, card_id, count) VALUES (?, ?, 1)", (uid, c_id))
+            await db.commit()
+
+            text = (
+                f"🎉 <b>УСПЕШНЫЙ КРАФТ!</b>\n\n"
+                f"Скрестив 3 дубликата ранга <i>{rarity}</i> (основные карты не пострадали), вы получили:\n"
+                f"🎴 <b>Карта #{c_id}</b> ({target_rarity})\n"
+                f"📝 {desc}"
+            )
+            await callback.message.delete()
+            await callback.message.answer_photo(photo=f_id, caption=text)
+        else:
+            await db.commit()
+            await callback.message.edit_text(
+                f"💥 <b>Крафт не удался!</b>\n"
+                f"Слияние карт ранга <i>{rarity}</i> оказалось нестабильным, но вы извлекли чистую энергию: "
+                f"<b>+{lottery_coins} 🪙 фемкоинов!</b>"
+            )
+
+trades: Dict[str, dict] = {}
+
+@dp.message(lambda msg: msg.text and any(get_normalized_command(msg.text) == p or msg.text.lower().strip().startswith(p) for p in ["трейд", "/trade", "trade"]))
+async def trade_init(message: Message):
+    await disqualify_referral(message.from_user.id)
+    if not message.reply_to_message or not message.reply_to_message.from_user:
+        return await message.reply("❗ Команда должна быть ответом на сообщение игрока, с которым вы хотите обменяться!")
+
+    sender = message.from_user
+    receiver = message.reply_to_message.from_user
+
+    if receiver.id == sender.id or receiver.is_bot:
+        return await message.reply("❌ Нельзя торговать с самим собой или ботами!")
+
+    p1_name = sender.username or sender.full_name
+    p2_name = receiver.username or receiver.full_name
+
+    trade_id = f"tr_{sender.id}_{receiver.id}_{int(time.time())}"
+    trades[trade_id] = {
+        "p1": sender.id,
+        "p2": receiver.id,
+        "p1_name": p1_name,
+        "p2_name": p2_name,
+        "p1_card": None,
+        "p2_card": None,
+        "p1_ok": False,
+        "p2_ok": False,
+    }
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Принять вызов на обмен", callback_data=f"trade_accept_{trade_id}")]
+    ])
+    await message.reply(
+        f"🤝 <b>{p1_name}</b> предлагает обмен картами игроку <b>{p2_name}</b>!\n"
+        f"<i>Правило: меняться можно только картами равной редкости, и только повторными (единственную отдать нельзя)!</i>",
+        reply_markup=kb,
     )
-    await safe_callback_answer(callback)
 
+@dp.callback_query(F.data.startswith("trade_accept_"))
+async def trade_accepted(callback: CallbackQuery):
+    trade_id = callback.data.replace("trade_accept_", "")
+    t = trades.get(trade_id)
+    if not t:
+        return await callback.answer("Сессия обмена истекла!", show_alert=True)
+    if callback.from_user.id != t["p2"]:
+        return await callback.answer("Этот обмен предложен не вам!", show_alert=True)
 
-@router.callback_query(F.data.startswith("trade_set:"))
-async def trade_set_callback(
-    callback: CallbackQuery,
-) -> None:
-    payload = parse_callback(
-        callback.data or "",
-        "trade_set:",
-    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Выбрать карту ({t['p1_name']})", callback_data=f"tr_pick_{trade_id}_{t['p1']}")],
+        [InlineKeyboardButton(text=f"Выбрать карту ({t['p2_name']})", callback_data=f"tr_pick_{trade_id}_{t['p2']}")],
+        [InlineKeyboardButton(text="✅ Подтвердить обмен", callback_data=f"tr_confirm_{trade_id}")]
+    ])
+    await callback.message.edit_text("🔄 <b>Окно обмена открыто!</b> Оба игрока должны выбрать карту дубликат одинаковой редкости.", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("tr_pick_"))
+async def trade_pick(callback: CallbackQuery):
+    _, _, trade_id, uid_str = callback.data.split("_")
+    uid = int(uid_str)
+    if callback.from_user.id != uid:
+        return await callback.answer("Это кнопка для другого игрока!", show_alert=True)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT c.id, c.rarity, inv.count
+            FROM inventory inv
+            JOIN cards c ON inv.card_id = c.id
+            WHERE inv.user_id = ? AND inv.count > 1
+        """, (uid,)) as cur:
+            duplicates = await cur.fetchall()
+
+    if not duplicates:
+        return await callback.answer("У вас нет повторных карт для обмена!", show_alert=True)
+
+    btns = [
+        [InlineKeyboardButton(text=f"#{c_id} ({r}) [x{cnt}]", callback_data=f"tr_set_{trade_id}_{c_id}")]
+        for c_id, r, cnt in duplicates
+    ]
+    await callback.message.reply("Выберите дубликат для предложения:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("tr_set_"))
+async def trade_set_card(callback: CallbackQuery):
+    _, _, trade_id, card_id_str = callback.data.split("_")
+    c_id = int(card_id_str)
+    t = trades.get(trade_id)
+    if not t:
+        return await callback.answer("Сессия истекла!", show_alert=True)
+
+    uid = callback.from_user.id
+    if uid == t["p1"]:
+        t["p1_card"] = c_id
+    elif uid == t["p2"]:
+        t["p2_card"] = c_id
+    else:
+        return await callback.answer("Вы не участник сделки!", show_alert=True)
+
+    await callback.message.edit_text(f"Вы выбрали карту #{c_id} для обмена. Вернитесь к основному окну.")
+
+@dp.callback_query(F.data.startswith("tr_confirm_"))
+async def trade_confirm(callback: CallbackQuery):
+    trade_id = callback.data.replace("tr_confirm_", "")
+    t = trades.get(trade_id)
+    if not t:
+        return await callback.answer("Сессия истекла!", show_alert=True)
+
+    uid = callback.from_user.id
+    if uid == t["p1"]:
+        t["p1_ok"] = True
+    elif uid == t["p2"]:
+        t["p2_ok"] = True
+
+    if not (t["p1_card"] and t["p2_card"]):
+        return await callback.answer("Оба участника должны выбрать карты!", show_alert=True)
+
+    if not (t["p1_ok"] and t["p2_ok"]):
+        return await callback.answer("Ожидание подтверждения второго участника!", show_alert=True)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT rarity FROM cards WHERE id = ?", (t["p1_card"],)) as cur:
+            r1 = (await cur.fetchone())[0]
+        async with db.execute("SELECT rarity FROM cards WHERE id = ?", (t["p2_card"],)) as cur:
+            r2 = (await cur.fetchone())[0]
+
+        if r1 != r2:
+            return await callback.message.reply(f"❌ Обмен невозможен! Редкости не совпадают ({r1} ≠ {r2}).")
+
+        await db.execute("UPDATE inventory SET count = count - 1 WHERE user_id = ? AND card_id = ?", (t["p1"], t["p1_card"]))
+        await db.execute("UPDATE inventory SET count = count - 1 WHERE user_id = ? AND card_id = ?", (t["p2"], t["p2_card"]))
+
+        for u, c in [(t["p1"], t["p2_card"]), (t["p2"], t["p1_card"])]:
+            async with db.execute("SELECT id FROM inventory WHERE user_id = ? AND card_id = ?", (u, c)) as cur:
+                row = await cur.fetchone()
+                if row:
+                    await db.execute("UPDATE inventory SET count = count + 1 WHERE id = ?", (row[0],))
+                else:
+                    await db.execute("INSERT INTO inventory (user_id, card_id, count) VALUES (?, ?, 1)", (u, c))
+
+        await db.commit()
+
+    del trades[trade_id]
+    await callback.message.edit_text("🎉 <b>Обмен успешно завершён!</b> Игроки обменялись картами равной редкости.")
+
+@dp.message(lambda msg: match_command(msg, ["top", "топ"]))
+async def top_command(message: Message):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT u.username, COUNT(inv.id) as total_c, u.first_seen
+            FROM users u
+            LEFT JOIN inventory inv ON u.user_id = inv.user_id
+            GROUP BY u.user_id
+            ORDER BY total_c DESC, u.first_seen ASC
+            LIMIT 10
+        """) as cur:
+            rows = await cur.fetchall()
+
+    text = "🏆 <b>ТОП 10 КОЛЛЕКЦИОНЕРОВ</b>\n\n"
+    for i, (uname, total, _) in enumerate(rows, 1):
+        clean_name = (uname or "Аноним").lstrip("@")
+        text += f"{i}. <b>{clean_name}</b> — {total} карт\n"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Показать ТОП 100 в ЛС", callback_data="top_100_dm")]
+    ])
+    await message.reply(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "top_100_dm")
+async def send_top_100(callback: CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            SELECT u.username, COUNT(inv.id) as total_c, u.first_seen
+            FROM users u
+            LEFT JOIN inventory inv ON u.user_id = inv.user_id
+            GROUP BY u.user_id
+            ORDER BY total_c DESC, u.first_seen ASC
+            LIMIT 100
+        """) as cur:
+            rows = await cur.fetchall()
+
+    text = "📜 <b>ТОП 100 ИГРОКОВ:</b>\n\n"
+    for i, (uname, total, _) in enumerate(rows, 1):
+        clean_name = (uname or "Аноним").lstrip("@")
+        text += f"{i}. {clean_name} — {total} шт.\n"
 
     try:
-        trade_id, card_id_raw = payload.rsplit(":", 1)
-        card_id = int(card_id_raw)
-    except (ValueError, AttributeError):
-        await safe_callback_answer(
-            callback,
-            "Некорректные данные",
-            show_alert=True,
-        )
-        return
+        await bot.send_message(callback.from_user.id, text)
+        await callback.answer("Топ 100 отправлен вам в ЛС!", show_alert=True)
+    except Exception:
+        await callback.answer("Сначала откройте диалог с ботом!", show_alert=True)
 
-    user_id = callback.from_user.id
+def get_main_shop_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Сброс КД (150 🪙)", callback_data="shop_buy_cd")],
+        [InlineKeyboardButton(text="🍀 Эликсир удачи на 3ч (250 🪙)", callback_data="shop_buy_luck")],
+        [InlineKeyboardButton(text="🎴 Случайная новая карта (400 🪙)", callback_data="shop_buy_new_card")],
+        [InlineKeyboardButton(text="👑 Купить VIP", callback_data="shop_menu_vip")],
+        [InlineKeyboardButton(text="💰 Купить фемкоины", callback_data="shop_menu_coins")],
+    ])
 
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT p1, p2, p1_card, p2_card, status
-            FROM trades
-            WHERE trade_id = ?
-            """,
-            (trade_id,),
-        ) as cursor:
-            trade = await cursor.fetchone()
+@dp.message(lambda msg: match_command(msg, ["shop", "магазин"]))
+async def shop_command(message: Message):
+    bot_me = await bot.get_me()
+    if message.chat.type != "private":
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏪 Перейти в магазин", url=f"https://t.me/{bot_me.username}?start=shop")]
+        ])
+        return await message.reply("🏪 Магазин доступен только в личных сообщениях с ботом!", reply_markup=kb)
 
-        if not trade or trade["status"] != "active":
-            await safe_callback_answer(
-                callback,
-                "Сделка закрыта",
-                show_alert=True,
-            )
-            return
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT femcoins FROM users WHERE user_id = ?", (message.from_user.id,)) as cur:
+            row = await cur.fetchone()
+            coins = row[0] if row else 0
 
-        async with db.execute(
-            """
-            SELECT count
-            FROM inventory
-            WHERE user_id = ? AND card_id = ?
-            """,
-            (user_id, card_id),
-        ) as cursor:
-            inventory = await cursor.fetchone()
-
-        if not inventory or int(inventory["count"]) < 2:
-            await safe_callback_answer(
-                callback,
-                "Карта больше не является дубликатом",
-                show_alert=True,
-            )
-            return
-
-        if user_id == int(trade["p1"]):
-            await db.execute(
-                """
-                UPDATE trades
-                SET p1_card = ?,
-                    p1_confirmed = 0,
-                    p2_confirmed = 0,
-                    updated_at = ?
-                WHERE trade_id = ?
-                """,
-                (card_id, now_ts(), trade_id),
-            )
-        elif user_id == int(trade["p2"]):
-            await db.execute(
-                """
-                UPDATE trades
-                SET p2_card = ?,
-                    p1_confirmed = 0,
-                    p2_confirmed = 0,
-                    updated_at = ?
-                WHERE trade_id = ?
-                """,
-                (card_id, now_ts(), trade_id),
-            )
-        else:
-            await safe_callback_answer(
-                callback,
-                "Вы не участник сделки",
-                show_alert=True,
-            )
-            return
-
-    await safe_callback_answer(
-        callback,
-        "Карта выбрана, подтверждения сброшены",
-        show_alert=True,
+    await message.reply(
+        f"🏪 <b>Магазин предметов</b>\n\n"
+        f"Ваш баланс: <b>{coins} 🪙 фемкоинов</b>\n\n"
+        f"Выберите нужный раздел или товар:",
+        reply_markup=get_main_shop_kb(),
     )
 
-
-@router.callback_query(F.data.startswith("trade_confirm:"))
-async def trade_confirm_callback(
-    callback: CallbackQuery,
-) -> None:
-    trade_id = parse_callback(
-        callback.data or "",
-        "trade_confirm:",
-    )
-
-    if not trade_id:
-        await safe_callback_answer(
-            callback,
-            "Некорректная сделка",
-            show_alert=True,
-        )
-        return
-
-    lock = trade_locks.setdefault(trade_id, asyncio.Lock())
-
-    async with lock:
-        async with transaction() as db:
-            async with db.execute(
-                """
-                SELECT p1, p2, p1_card, p2_card,
-                       p1_confirmed, p2_confirmed, status
-                FROM trades
-                WHERE trade_id = ?
-                """,
-                (trade_id,),
-            ) as cursor:
-                trade = await cursor.fetchone()
-
-            if not trade or trade["status"] != "active":
-                await safe_callback_answer(
-                    callback,
-                    "Сделка закрыта",
-                    show_alert=True,
-                )
-                return
-
-            user_id = callback.from_user.id
-            p1 = int(trade["p1"])
-            p2 = int(trade["p2"])
-
-            if user_id not in {p1, p2}:
-                await safe_callback_answer(
-                    callback,
-                    "Вы не участник сделки",
-                    show_alert=True,
-                )
-                return
-
-            if not trade["p1_card"] or not trade["p2_card"]:
-                await safe_callback_answer(
-                    callback,
-                    "Оба игрока должны выбрать карту",
-                    show_alert=True,
-                )
-                return
-
-            if user_id == p1:
-                await db.execute(
-                    """
-                    UPDATE trades
-                    SET p1_confirmed = 1,
-                        updated_at = ?
-                    WHERE trade_id = ?
-                    """,
-                    (now_ts(), trade_id),
-                )
-            else:
-                await db.execute(
-                    """
-                    UPDATE trades
-                    SET p2_confirmed = 1,
-                        updated_at = ?
-                    WHERE trade_id = ?
-                    """,
-                    (now_ts(), trade_id),
-                )
-
-            if not (
-                (
-                    user_id == p1
-                    and int(trade["p2_confirmed"]) == 1
-                )
-                or (
-                    user_id == p2
-                    and int(trade["p1_confirmed"]) == 1
-                )
-            ):
-                await safe_callback_answer(
-                    callback,
-                    "Ожидается подтверждение второго игрока",
-                )
-                return
-
-            card_one = int(trade["p1_card"])
-            card_two = int(trade["p2_card"])
-
-            async with db.execute(
-                """
-                SELECT id, rarity
-                FROM cards
-                WHERE id IN (?, ?)
-                """,
-                (card_one, card_two),
-            ) as cursor:
-                card_rows = await cursor.fetchall()
-
-            rarity_by_id = {
-                int(row["id"]): str(row["rarity"])
-                for row in card_rows
-            }
-
-            if (
-                card_one not in rarity_by_id
-                or card_two not in rarity_by_id
-                or rarity_by_id[card_one] != rarity_by_id[card_two]
-            ):
-                await safe_callback_answer(
-                    callback,
-                    "Редкости карт должны совпадать",
-                    show_alert=True,
-                )
-                return
-
-            async with db.execute(
-                """
-                SELECT user_id, card_id, count
-                FROM inventory
-                WHERE (user_id = ? AND card_id = ?)
-                   OR (user_id = ? AND card_id = ?)
-                """,
-                (p1, card_one, p2, card_two),
-            ) as cursor:
-                inventories = await cursor.fetchall()
-
-            inventory_map = {
-                (int(row["user_id"]), int(row["card_id"])): int(row["count"])
-                for row in inventories
-            }
-
-            if (
-                inventory_map.get((p1, card_one), 0) < 2
-                or inventory_map.get((p2, card_two), 0) < 2
-            ):
-                await safe_callback_answer(
-                    callback,
-                    "Недостаточно дубликатов",
-                    show_alert=True,
-                )
-                return
-
-            await db.execute(
-                """
-                UPDATE inventory
-                SET count = count - 1
-                WHERE user_id = ? AND card_id = ? AND count >= 2
-                """,
-                (p1, card_one),
-            )
-
-            await db.execute(
-                """
-                UPDATE inventory
-                SET count = count - 1
-                WHERE user_id = ? AND card_id = ? AND count >= 2
-                """,
-                (p2, card_two),
-            )
-
-            await db.execute(
-                """
-                INSERT INTO inventory(user_id, card_id, count)
-                VALUES (?, ?, 1)
-                ON CONFLICT(user_id, card_id)
-                DO UPDATE SET count = count + 1
-                """,
-                (p1, card_two),
-            )
-
-            await db.execute(
-                """
-                INSERT INTO inventory(user_id, card_id, count)
-                VALUES (?, ?, 1)
-                ON CONFLICT(user_id, card_id)
-                DO UPDATE SET count = count + 1
-                """,
-                (p2, card_one),
-            )
-
-            await db.execute(
-                """
-                UPDATE trades
-                SET status = 'completed',
-                    updated_at = ?
-                WHERE trade_id = ?
-                """,
-                (now_ts(), trade_id),
-            )
+@dp.callback_query(F.data == "shop_main")
+async def shop_main_callback(callback: CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT femcoins FROM users WHERE user_id = ?", (callback.from_user.id,)) as cur:
+            row = await cur.fetchone()
+            coins = row[0] if row else 0
 
     await callback.message.edit_text(
-        "🎉 <b>Обмен завершён!</b>\n"
-        "Карты успешно переданы."
+        f"🏪 <b>Магазин предметов</b>\n\n"
+        f"Ваш баланс: <b>{coins} 🪙 фемкоинов</b>\n\n"
+        f"Выберите нужный раздел или товар:",
+        reply_markup=get_main_shop_kb()
     )
+    await callback.answer()
 
-    await safe_callback_answer(callback)
-
-
-@router.message(
-    lambda message: (
-        message.text
-        and re.match(
-            r"^/?бот\s+[+-]вип\s+\d+",
-            message.text.strip(),
-            re.IGNORECASE,
-        )
-    )
+VIP_INFO_TEXT = (
+    "👑 <b>Преимущества VIP-статуса:</b>\n\n"
+    "• С шансом 20% может с одного «фем» выпасть 2 карты!\n"
+    "• «фем» можно прописывать раз в 2 часа, а не 3.\n"
+    "• При выпадении дубликата идет компенсация в виде фемкоинов (за редкий — 5, за сверхредкий — 10 и т.д.).\n"
+    "• Повышенный шанс на редкие карты.\n"
+    "• Комиссия на перевод фемкоинов между игроками не 10%, а 5%.\n"
+    "• Дейлик можно прописывать раз в 22 часа, а не 24, и дает всегда на 5 фемкоинов больше.\n"
+    "• Скидка на покупку фемкоинов в магазине 1% (это в шутку больше)."
 )
-async def admin_vip_command(message: Message) -> None:
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
 
-    parts = message.text.split()
+@dp.callback_query(F.data == "shop_menu_vip")
+async def shop_menu_vip_callback(callback: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Купить за звёзды", callback_data="vip_pay_stars")],
+        [InlineKeyboardButton(text="🪙 Купить за фемкоины", callback_data="vip_pay_femcoins")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="shop_main")]
+    ])
+    await callback.message.edit_text(VIP_INFO_TEXT, reply_markup=kb)
+    await callback.answer()
 
-    try:
-        hours = int(parts[2])
-        operation = parts[1].lower()
-    except (IndexError, ValueError):
-        await message.answer(
-            "Формат: <code>/бот +вип 12</code> ответом "
-            "на сообщение пользователя."
-        )
-        return
-
-    target = (
-        message.reply_to_message.from_user
-        if message.reply_to_message
-        else None
+@dp.callback_query(F.data == "vip_pay_stars")
+async def vip_pay_stars_callback(callback: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 день — 250 ⭐", callback_data="buy_vip_star_1")],
+        [InlineKeyboardButton(text="1 неделя — 800 ⭐", callback_data="buy_vip_star_7")],
+        [InlineKeyboardButton(text="1 месяц — 2000 ⭐", callback_data="buy_vip_star_30")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="shop_menu_vip")]
+    ])
+    await callback.message.edit_text(
+        VIP_INFO_TEXT + "\n\n💳 <b>Выберите тариф для покупки за Telegram Stars:</b>",
+        reply_markup=kb
     )
+    await callback.answer()
 
-    if not target:
-        await message.answer(
-            "Используйте команду ответом на сообщение пользователя."
-        )
-        return
+@dp.callback_query(F.data == "vip_pay_femcoins")
+async def vip_pay_femcoins_callback(callback: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 день — 1500 🪙", callback_data="buy_vip_fem_1")],
+        [InlineKeyboardButton(text="1 неделя — 4500 🪙", callback_data="buy_vip_fem_7")],
+        [InlineKeyboardButton(text="1 месяц — 10000 🪙", callback_data="buy_vip_fem_30")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="shop_menu_vip")]
+    ])
+    await callback.message.edit_text(
+        VIP_INFO_TEXT + "\n\n💳 <b>Выберите тариф для покупки за фемкоины:</b>",
+        reply_markup=kb
+    )
+    await callback.answer()
 
-    await ensure_user(target)
+@dp.callback_query(F.data == "shop_menu_coins")
+async def shop_menu_coins_callback(callback: CallbackQuery):
+    text = (
+        "💰 <b>Зачем нужны фемкоины?</b>\n\n"
+        "Фемкоины — это основная валюта бота. За них вы можете крутить казино, покупать скипы КД, эликсиры удачи, редкие карты, а также приобретать VIP-статус!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="100 фемкоинов — 15 ⭐", callback_data="stars_pack_100")],
+        [InlineKeyboardButton(text="500 фемкоинов — 70 ⭐", callback_data="stars_pack_500")],
+        [InlineKeyboardButton(text="1000 фемкоинов — 135 ⭐", callback_data="stars_pack_1000")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="shop_main")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
 
-    async with transaction() as db:
-        async with db.execute(
-            """
-            SELECT vip_until
-            FROM users
+@dp.callback_query(F.data == "shop_buy_cd")
+async def buy_cd_reset_accum(callback: CallbackQuery):
+    uid = callback.from_user.id
+    now = time.time()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT femcoins, cd_resets_count, cd_reset_expires FROM users WHERE user_id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+            coins = row[0] if row else 0
+            resets = row[1] if row else 0
+            resets_exp = row[2] if row else 0
+
+        if coins < 150:
+            return await callback.answer("Недостаточно фемкоинов (нужно 150)!", show_alert=True)
+
+        if resets > 0 and resets_exp <= now:
+            resets = 0
+
+        new_resets = resets + 1
+        new_exp = now + 3 * 3600
+
+        await db.execute("""
+            UPDATE users 
+            SET femcoins = femcoins - 150, cd_resets_count = ?, cd_reset_expires = ?
             WHERE user_id = ?
-            """,
-            (target.id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        """, (new_resets, new_exp, uid))
+        await db.commit()
 
-        old_until = float(row["vip_until"] or 0)
-        current = now_ts()
+    await callback.answer(f"✅ Скип КД успешно куплен! У вас накопилось: {new_resets} шт. (хранятся 3 часа).", show_alert=True)
 
-        if operation == "+вип":
-            new_until = max(current, old_until) + hours * 3600
-        else:
-            new_until = max(0, old_until - hours * 3600)
-
-        await db.execute(
-            """
-            UPDATE users
-            SET vip_until = ?
+@dp.callback_query(F.data == "shop_buy_luck")
+async def buy_luck(callback: CallbackQuery):
+    uid = callback.from_user.id
+    now = time.time()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT femcoins FROM users WHERE user_id = ?", (uid,)) as cur:
+            coins = (await cur.fetchone())[0]
+        if coins < 250:
+            return await callback.answer("Недостаточно фемкоинов (нужно 250)!", show_alert=True)
+        await db.execute("""
+            UPDATE users 
+            SET femcoins = femcoins - 250, luck_expires = ?
             WHERE user_id = ?
-            """,
-            (new_until, target.id),
-        )
+        """, (now + 3 * 3600, uid))
+        await db.commit()
+    await callback.answer("🍀 Эликсир активирован на 3 часа! Шансы повышены.", show_alert=True)
 
-    await log_action(
-        message.from_user.id,
-        f"{operation} {hours}ч пользователю {target.id}",
+@dp.callback_query(F.data == "shop_buy_new_card")
+async def buy_new_card(callback: CallbackQuery):
+    uid = callback.from_user.id
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT femcoins FROM users WHERE user_id = ?", (uid,)) as cur:
+            coins = (await cur.fetchone())[0]
+        if coins < 400:
+            return await callback.answer("Недостаточно фемкоинов (нужно 400)!", show_alert=True)
+
+        async with db.execute("""
+            SELECT id, file_id, rarity, description FROM cards 
+            WHERE id NOT IN (SELECT card_id FROM inventory WHERE user_id = ?)
+            ORDER BY RANDOM() LIMIT 1
+        """, (uid,)) as cur:
+            card = await cur.fetchone()
+
+        if not card:
+            return await callback.answer("У вас уже есть ВСЕ существующие карты!", show_alert=True)
+
+        c_id, f_id, rarity, desc = card
+        await db.execute("UPDATE users SET femcoins = femcoins - 400 WHERE user_id = ?", (uid,))
+        await db.execute("INSERT INTO inventory (user_id, card_id, count) VALUES (?, ?, 1)", (uid, c_id))
+        await db.commit()
+
+    await callback.message.answer_photo(photo=f_id, caption=f"🎁 <b>Куплена новая карта #{c_id}!</b>\nРедкость: {rarity}\n{desc}")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("buy_vip_fem_"))
+async def buy_vip_with_femcoins(callback: CallbackQuery):
+    days = int(callback.data.replace("buy_vip_fem_", ""))
+    prices = {1: 1500, 7: 4500, 30: 10000}
+    price = prices.get(days, 1500)
+    uid = callback.from_user.id
+    now = time.time()
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT femcoins, vip_until FROM users WHERE user_id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+            coins = row[0] if row else 0
+            vip_until = row[1] if row else 0
+
+        if coins < price:
+            return await callback.answer(f"❌ Недостаточно фемкоинов (нужно {price})!", show_alert=True)
+
+        base_time = max(now, vip_until)
+        new_vip_until = base_time + days * 86400
+
+        await db.execute("UPDATE users SET femcoins = femcoins - ?, vip_until = ? WHERE user_id = ?", (price, new_vip_until, uid))
+        await db.commit()
+
+    await callback.message.answer(f"🎉 <b>Поздравляем!</b> Вы успешно приобрели VIP-статус на {days} дн. за {price} 🪙 фемкоинов!")
+    await callback.answer("VIP успешно активирован!")
+
+@dp.callback_query(F.data.startswith("buy_vip_star_"))
+async def buy_vip_stars_invoice(callback: CallbackQuery):
+    days = int(callback.data.replace("buy_vip_star_", ""))
+    prices_map = {1: (250, "1 день"), 7: (800, "1 неделя"), 30: (2000, "1 месяц")}
+    stars, title_dur = prices_map.get(days, (250, "1 день"))
+
+    prices = [LabeledPrice(label=f"VIP на {title_dur}", amount=stars)]
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title=f"VIP-статус на {title_dur}",
+        description=f"Покупка премиум VIP-статуса в боте на {title_dur}.",
+        payload=f"buy_vip_{days}",
+        currency="XTR",
+        prices=prices,
+        provider_token="",
     )
+    await callback.answer()
 
-    await message.answer(
-        f"✅ VIP пользователя изменён.\n"
-        f"Текущий срок: "
-        f"<b>{format_date(new_until) if new_until else 'отсутствует'}</b>"
+@dp.callback_query(F.data.startswith("stars_pack_"))
+async def buy_coins_stars_invoice(callback: CallbackQuery):
+    pack_amount = int(callback.data.replace("stars_pack_", ""))
+    stars_map = {100: 15, 500: 70, 1000: 135}
+    stars_price = stars_map.get(pack_amount, 15)
+
+    prices = [LabeledPrice(label=f"{pack_amount} Фемкоинов", amount=stars_price)]
+    await bot.send_invoice(
+        chat_id=callback.from_user.id,
+        title=f"Покупка {pack_amount} Фемкоинов",
+        description=f"Пакет игровой валюты: {pack_amount} фемкоинов.",
+        payload=f"buy_coins_{pack_amount}",
+        currency="XTR",
+        prices=prices,
+        provider_token="",
     )
+    await callback.answer()
 
+@dp.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout_q: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
 
-@router.message(
-    lambda message: (
-        message.text
-        and re.match(
-            r"^/?бот\s+[+-]коины\s+\d+",
-            message.text.strip(),
-            re.IGNORECASE,
-        )
-    )
-)
-async def admin_coins_command(message: Message) -> None:
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: Message):
+    payload = message.successful_payment.invoice_payload
+    now = time.time()
+    uid = message.from_user.id
 
-    parts = message.text.split()
+    if payload.startswith("buy_coins_"):
+        coins_to_add = int(payload.replace("buy_coins_", ""))
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (coins_to_add, uid))
+            await db.commit()
+        await message.reply(f"⭐ Оплата прошла успешно! Начислено <b>+{coins_to_add} 🪙 фемкоинов</b>.")
 
-    try:
-        operation = parts[1].lower()
-        amount = int(parts[2])
-    except (IndexError, ValueError):
-        await message.answer(
-            "Формат: <code>/бот +коины 100</code> ответом."
-        )
-        return
+    elif payload.startswith("buy_vip_"):
+        days = int(payload.replace("buy_vip_", ""))
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT vip_until FROM users WHERE user_id = ?", (uid,)) as cur:
+                row = await cur.fetchone()
+                vip_until = row[0] if row else 0
 
-    target = (
-        message.reply_to_message.from_user
-        if message.reply_to_message
-        else None
-    )
+            base_time = max(now, vip_until)
+            new_vip_until = base_time + days * 86400
 
-    if not target or amount < 0:
-        await message.answer(
-            "Команда должна быть ответом на сообщение пользователя."
-        )
-        return
+            await db.execute("UPDATE users SET vip_until = ? WHERE user_id = ?", (new_vip_until, uid))
+            await db.commit()
+        await message.reply(f"⭐ Оплата прошла успешно! Вам активирован <b>VIP-статус</b> на {days} дн. 👑")
 
-    await ensure_user(target)
+def get_chat_vip_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Купить за звёзды", callback_data="vip_pay_stars")],
+        [InlineKeyboardButton(text="🪙 Купить за фемкоины", callback_data="vip_pay_femcoins")]
+    ])
 
-    async with transaction() as db:
-        if operation == "+коины":
-            await db.execute(
-                """
-                UPDATE users
-                SET femcoins = femcoins + ?
-                WHERE user_id = ?
-                """,
-                (amount, target.id),
-            )
+@dp.message(lambda msg: msg.text and (match_command(msg, ["vip", "вип", "купить вип"]) or msg.text.lower().strip() in ["vip", "вип", "купить вип"]))
+async def vip_section_trigger(message: Message):
+    is_private = (message.chat.type == "private")
+    kb = get_chat_vip_kb()
+    if is_private:
+        kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="shop_menu_vip")])
+
+    await message.reply(VIP_INFO_TEXT, reply_markup=kb)
+
+@dp.message(lambda msg: match_command(msg, ["promo", "промо"]))
+async def promo_command(message: Message, state: FSMContext):
+    await message.reply("🔑 Отправьте промокод следующим сообщением:")
+    await state.set_state(UserStates.waiting_for_promo_code)
+
+@dp.message(UserStates.waiting_for_promo_code)
+async def process_promo(message: Message, state: FSMContext):
+    code = message.text.strip()
+    uid = message.from_user.id
+    now = time.time()
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT p_type, reward_type, reward_val, expires_at, is_used FROM promo_codes WHERE code = ?", (code,)) as cur:
+            promo = await cur.fetchone()
+
+        if not promo:
+            await state.clear()
+            return await message.reply("❌ Промокод не существует или введен неверно.")
+
+        p_type, r_type, r_val, exp, is_used = promo
+
+        if now > exp:
+            await state.clear()
+            return await message.reply("⌛ Срок действия этого промокода уже истек.")
+
+        if p_type == "L" and is_used:
+            await state.clear()
+            return await message.reply("❌ Этот одноразовый промокод уже был активирован кем-то другим.")
+
+        async with db.execute("SELECT 1 FROM promo_claims WHERE user_id = ? AND code = ?", (uid, code)) as cur:
+            if await cur.fetchone():
+                await state.clear()
+                return await message.reply("❌ Вы уже активировали этот промокод!")
+
+        if r_type == "f":
+            await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (r_val, uid))
+            reward_msg = f"+{r_val} 🪙 фемкоинов"
         else:
-            await db.execute(
-                """
-                UPDATE users
-                SET femcoins = MAX(0, femcoins - ?)
-                WHERE user_id = ?
-                """,
-                (amount, target.id),
-            )
+            await db.execute("UPDATE users SET cd_resets_count = cd_resets_count + 1, cd_reset_expires = ? WHERE user_id = ?", (now + 3 * 3600, uid))
+            reward_msg = "Сброс КД на 3 часа"
 
-    await log_action(
-        message.from_user.id,
-        f"{operation} {amount} пользователю {target.id}",
+        if p_type == "L":
+            await db.execute("UPDATE promo_codes SET is_used = 1 WHERE code = ?", (code,))
+
+        await db.execute("INSERT INTO promo_claims (user_id, code, claimed_at) VALUES (?, ?, ?)", (uid, code, now))
+        await db.commit()
+
+    await state.clear()
+    await message.reply(f"🎉 Промокод успешно активирован! Ваша награда: <b>{reward_msg}</b>")
+
+def build_casino_kb(current_bet: int) -> InlineKeyboardMarkup:
+    b10 = f"[{current_bet}🪙]" if current_bet == 10 else "10 🪙"
+    b20 = f"[{current_bet}🪙]" if current_bet == 20 else "20 🪙"
+    b50 = f"[{current_bet}🪙]" if current_bet == 50 else "50 🪙"
+    b100 = f"[{current_bet}🪙]" if current_bet == 100 else "100 🪙"
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"{'🔘 ' if current_bet==10 else ''}{b10}", callback_data="setbet_10"),
+            InlineKeyboardButton(text=f"{'🔘 ' if current_bet==20 else ''}{b20}", callback_data="setbet_20"),
+            InlineKeyboardButton(text=f"{'🔘 ' if current_bet==50 else ''}{b50}", callback_data="setbet_50"),
+            InlineKeyboardButton(text=f"{'🔘 ' if current_bet==100 else ''}{b100}", callback_data="setbet_100")
+        ],
+        [InlineKeyboardButton(text=f"🎲 Бросить кости (Ставка: {current_bet} 🪙)", callback_data="kaz_dice")],
+        [
+            InlineKeyboardButton(text=f"🔴 Красное (x2, {current_bet})", callback_data="kaz_roul_red"),
+            InlineKeyboardButton(text=f"⚫ Черное (x2, {current_bet})", callback_data="kaz_roul_black")
+        ],
+        [InlineKeyboardButton(text=f"🟢 Зеро (x14, {current_bet})", callback_data="kaz_roul_zero")],
+        [InlineKeyboardButton(text=f"🎰 Слоты 777 (Ставка: {current_bet} 🪙)", callback_data="kaz_slots")]
+    ])
+
+@dp.message(lambda msg: match_command(msg, ["kaz", "казино"]))
+async def casino_menu(message: Message):
+    await disqualify_referral(message.from_user.id)
+    uid = message.from_user.id
+    current_bet = user_casino_bets.get(uid, 20)
+    kb = build_casino_kb(current_bet)
+    await message.reply(
+        f"🎰 <b>Добро пожаловать в Фем-Казино!</b>\n"
+        f"🎯 Активная ставка: <b>{current_bet} 🪙</b> (переключайте кнопками в первом ряду):\n"
+        f"<i>Для Зеро и Рулетки минимальная ставка 20 коинов.</i>",
+        reply_markup=kb
     )
 
-    await message.answer("✅ Баланс изменён.")
+@dp.callback_query(F.data.startswith("setbet_"))
+async def set_casino_bet(callback: CallbackQuery):
+    await disqualify_referral(callback.from_user.id)
+    bet_val = int(callback.data.replace("setbet_", ""))
+    uid = callback.from_user.id
+    user_casino_bets[uid] = bet_val
+    kb = build_casino_kb(bet_val)
 
+    await callback.message.edit_text(
+        f"🎰 <b>Добро пожаловать в Фем-Казино!</b>\n"
+        f"🎯 Активная ставка переключена на: <b>{bet_val} 🪙</b>\n"
+        f"<i>Выберите игру ниже:</i>",
+        reply_markup=kb
+    )
+    await callback.answer(f"Ставка выбрана: {bet_val} 🪙")
 
-@router.message(
-    lambda message: command_is(message, "log")
-)
-async def logs_command(message: Message) -> None:
+@dp.callback_query(F.data.startswith("kaz_"))
+async def casino_play(callback: CallbackQuery):
+    await disqualify_referral(callback.from_user.id)
+    uid = callback.from_user.id
+    u_name = callback.from_user.username or callback.from_user.full_name
+    act = callback.data
+    bet = user_casino_bets.get(uid, 20)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT femcoins FROM users WHERE user_id = ?", (uid,)) as cur:
+            coins = (await cur.fetchone())[0]
+
+        if act == "kaz_dice":
+            if coins < bet:
+                return await callback.answer(f"Не хватает фемкоинов (нужно {bet})!", show_alert=True)
+            u_roll = random.randint(1, 6)
+            b_roll = random.randint(1, 6)
+            if u_roll > b_roll:
+                await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (bet, uid))
+                res = f"🎲 Игрок <b>{u_name}</b> выиграл! ({u_roll} против {b_roll} у бота). Награда: +{bet} 🪙"
+            elif u_roll < b_roll:
+                await db.execute("UPDATE users SET femcoins = femcoins - ? WHERE user_id = ?", (bet, uid))
+                res = f"🎲 Игрок <b>{u_name}</b> проиграл! ({u_roll} против {b_roll} у бота). -{bet} 🪙"
+            else:
+                res = f"🎲 Игрок <b>{u_name}</b> сыграл вничью! ({u_roll} и {b_roll}). Монеты сохранены."
+
+        elif act.startswith("kaz_roul_"):
+            if bet < 20:
+                return await callback.answer("Для рулетки и зеро минимальная ставка 20 монет!", show_alert=True)
+            choice = act.replace("kaz_roul_", "")
+            if coins < bet:
+                return await callback.answer(f"Нужно минимум {bet} монет!", show_alert=True)
+
+            num = random.randint(0, 36)
+            color = "zero" if num == 0 else ("red" if num % 2 == 1 else "black")
+
+            if choice == color:
+                mult = 14 if choice == "zero" else 2
+                winnings = bet * mult - bet
+                await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (winnings, uid))
+                res = f"🎉 <b>{u_name}</b>, выпало {num} ({color})! Вы выиграли +{winnings} 🪙!"
+            else:
+                await db.execute("UPDATE users SET femcoins = femcoins - ? WHERE user_id = ?", (bet, uid))
+                res = f"💀 <b>{u_name}</b>, выпало {num} ({color})! Вы потеряли {bet} 🪙."
+
+        elif act == "kaz_slots":
+            if coins < bet:
+                return await callback.answer(f"Нужно {bet} монет!", show_alert=True)
+            emojis = ["🍒", "🍋", "🍇", "💎", "7️⃣"]
+            s1, s2, s3 = random.choices(emojis, k=3)
+            if s1 == s2 == s3 == "7️⃣":
+                jackpot = bet * 15
+                await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (jackpot, uid))
+                res = f"🎰 <b>{u_name}</b> [{s1}|{s2}|{s3}] ДЖЕКПОТ 777! +{jackpot} 🪙!"
+            elif s1 == s2 == s3:
+                win_slots = bet * 4
+                await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (win_slots, uid))
+                res = f"🎰 <b>{u_name}</b> [{s1}|{s2}|{s3}] ТРИ В РЯД! +{win_slots} 🪙!"
+            else:
+                await db.execute("UPDATE users SET femcoins = femcoins - ? WHERE user_id = ?", (bet, uid))
+                res = f"🎰 <b>{u_name}</b> [{s1}|{s2}|{s3}] Не повезло! -{bet} 🪙."
+
+        await db.commit()
+
+    await callback.message.reply(res)
+    await callback.answer()
+
+@dp.message(lambda msg: match_command(msg, ["plus_foto"]))
+async def plus_foto_cmd(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    await message.reply("Отправьте фото, которое нужно добавить в базу:")
+    await state.set_state(AdminStates.waiting_for_photo)
+
+@dp.message(AdminStates.waiting_for_photo, F.photo)
+async def process_admin_photo(message: Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    await state.update_data(file_id=photo_id)
+    btns = [[InlineKeyboardButton(text=r, callback_data=f"setrar_{r}")] for r in RARITIES]
+    await message.reply("Выберите редкость для этой карты:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+
+@dp.callback_query(F.data.startswith("setrar_"))
+async def process_admin_rarity(callback: CallbackQuery, state: FSMContext):
+    rarity = callback.data.replace("setrar_", "")
+    await state.update_data(rarity=rarity)
+    await callback.message.edit_text(f"Редкость: {rarity}. Теперь отправьте текстовое описание для карты:")
+    await state.set_state(AdminStates.waiting_for_custom_desc)
+
+@dp.message(AdminStates.waiting_for_custom_desc)
+async def process_admin_desc(message: Message, state: FSMContext):
+    data = await state.get_data()
+    file_id = data["file_id"]
+    rarity = data["rarity"]
+    desc = message.text
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute("INSERT INTO cards (file_id, rarity, description) VALUES (?, ?, ?)", (file_id, rarity, desc))
+        card_id = cur.lastrowid
+        await db.commit()
+
+    admin_display = await get_user_display_name(message.from_user.id, clean=True)
+    await add_log(message.from_user.id, f"{admin_display} добавил карту #{card_id} [{rarity}]")
+    await state.clear()
+    await message.reply(f"✅ Карта #{card_id} успешно создана и добавлена в базу!")
+
+@dp.message(lambda msg: msg.text and msg.text.lower().strip() in ["all card", "100 card"])
+async def view_cards_album(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    limit = 100 if message.text.lower().strip() == "100 card" else 500
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT id, file_id, rarity FROM cards ORDER BY id DESC LIMIT ?", (limit,)) as cur:
+            cards = await cur.fetchall()
+
+    if not cards:
+        return await message.reply("В базе нет карт.")
+
+    for i in range(0, len(cards), 10):
+        chunk = cards[i:i+10]
+        media_group = [InputMediaPhoto(media=c[1], caption=f"ID: {c[0]} | {c[2]}") for c in chunk]
+        await message.answer_media_group(media=media_group)
+        await asyncio.sleep(0.5)
+
+@dp.message(lambda msg: msg.text and (msg.text.startswith("/card") or msg.text.startswith("card")))
+async def card_manage(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return
+    c_id = int(parts[1])
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT file_id, rarity, description FROM cards WHERE id = ?", (c_id,)) as cur:
+            card = await cur.fetchone()
+
+        if not card:
+            return await message.reply(f"Карта #{c_id} не найдена.")
+
+        async with db.execute("SELECT COUNT(DISTINCT user_id), SUM(count) FROM inventory WHERE card_id = ?", (c_id,)) as cur:
+            stats = await cur.fetchone()
+            unique_owners = stats[0] or 0
+            total_copies = stats[1] or 0
+
+    f_id, rarity, desc = card
+    caption = (
+        f"🎴 <b>Профиль карты #{c_id}</b>\n"
+        f"🏷 <b>Редкость:</b> {rarity}\n"
+        f"📝 <b>Описание:</b> {desc}\n\n"
+        f"👥 Уникальных владельцев: {unique_owners}\n"
+        f"📦 Всего дубликатов на руках: {total_copies}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить редкость", callback_data=f"editrar_{c_id}")],
+        [InlineKeyboardButton(text="📝 Изменить описание", callback_data=f"editdesc_{c_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить карту", callback_data=f"delcard_{c_id}")]
+    ])
+    await message.answer_photo(photo=f_id, caption=caption, reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("editrar_"))
+async def edit_card_rarity(callback: CallbackQuery):
+    c_id = callback.data.split("_")[1]
+    btns = [[InlineKeyboardButton(text=r, callback_data=f"saverar_{c_id}_{r}")] for r in RARITIES]
+    await callback.message.reply("Выберите новую редкость:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("saverar_"))
+async def save_card_rarity(callback: CallbackQuery):
+    _, c_id, r = callback.data.split("_")
+    admin_display = await get_user_display_name(callback.from_user.id, clean=True)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE cards SET rarity = ? WHERE id = ?", (r, int(c_id)))
+        await db.commit()
+    await add_log(callback.from_user.id, f"{admin_display} изменил редкость карты #{c_id} на {r}")
+    await callback.message.edit_text(f"Редкость карты #{c_id} изменена на {r}!")
+
+@dp.callback_query(F.data.startswith("delcard_"))
+async def delete_card(callback: CallbackQuery):
+    c_id = int(callback.data.split("_")[1])
+    admin_display = await get_user_display_name(callback.from_user.id, clean=True)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM cards WHERE id = ?", (c_id,))
+        await db.execute("DELETE FROM inventory WHERE card_id = ?", (c_id,))
+        await db.execute("UPDATE cards SET id = id - 1 WHERE id > ?", (c_id,))
+        await db.execute("UPDATE inventory SET card_id = card_id - 1 WHERE card_id > ?", (c_id,))
+        await db.commit()
+    await add_log(callback.from_user.id, f"{admin_display} удалил карту #{c_id} со сдвигом ID")
+    await callback.message.edit_text(f"🗑 Карта #{c_id} удалена, номера последующих карт сдвинуты на -1.")
+
+@dp.message(lambda msg: msg.text and msg.text.lower().strip().startswith("твой профиль"))
+async def forced_profile(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+
+    target_user = None
+    if message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+    else:
+        parts = message.text.split()
+        if len(parts) > 2:
+            uname = parts[2].lstrip("@")
+            async with aiosqlite.connect(DB_NAME) as db:
+                async with db.execute("SELECT user_id FROM users WHERE username = ? OR username = ?", (uname, f"@{uname}")) as cur:
+                    row = await cur.fetchone()
+                    if row:
+                        target_user = types.User(id=row[0], is_bot=False, first_name=uname)
+
+    if not target_user:
+        return await message.reply("Укажите пользователя ответом или @username!")
+
+    await show_user_profile(message.chat.id, target_user)
+
+@dp.message(lambda msg: match_command(msg, ["admins"]))
+async def list_admins(message: Message):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
 
-    async with db_connection() as db:
-        async with db.execute(
-            """
-            SELECT admin_id, action, timestamp
-            FROM logs
-            ORDER BY id DESC
-            LIMIT 25
-            """
-        ) as cursor:
-            rows = await cursor.fetchall()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM admins") as cur:
+            rows = await cur.fetchall()
 
     if not rows:
-        await message.answer("Логи пусты.")
+        return await message.reply("Дополнительных админов нет.")
+
+    buttons = []
+    for (uid,) in rows:
+        disp_name = await get_user_display_name(uid, clean=True)
+        buttons.append([InlineKeyboardButton(text=f"❌ Снять {disp_name}", callback_data=f"removeadm_{uid}")])
+
+    await message.reply("Список действующих администраторов:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("removeadm_"))
+async def remove_adm_cb(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN_ID:
+        return
+    uid = int(callback.data.replace("removeadm_", ""))
+    disp_name = await get_user_display_name(uid, clean=True)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM admins WHERE user_id = ?", (uid,))
+        await db.commit()
+    await callback.message.edit_text(f"Администратор {disp_name} успешно снят.")
+
+broadcast_buffer: Dict[int, List[Message]] = {}
+
+@dp.message(lambda msg: match_command(msg, ["add"]))
+async def start_broadcast(message: Message, state: FSMContext):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+    broadcast_buffer[message.from_user.id] = []
+    await state.set_state(AdminStates.broadcast_collecting)
+    await message.reply("Отправляйте сообщения для рассылки. Когда закончите, напишите /save.")
+
+@dp.message(AdminStates.broadcast_collecting)
+async def collect_broadcast(message: Message, state: FSMContext):
+    if message.text and match_command(message, ["save"]):
+        msgs = broadcast_buffer.get(message.from_user.id, [])
+        await state.clear()
+        if not msgs:
+            return await message.reply("Ни одного сообщения не было отправлено. Рассылка отменена.")
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT chat_id FROM chats") as cur:
+                chats = await cur.fetchall()
+
+        count = 0
+        for (c_id,) in chats:
+            try:
+                for m in msgs:
+                    await bot.copy_message(chat_id=c_id, from_chat_id=m.chat.id, message_id=m.message_id)
+                count += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                continue
+
+        del broadcast_buffer[message.from_user.id]
+        return await message.reply(f"✅ Рассылка успешно завершена в {count} чатов!")
+
+    broadcast_buffer[message.from_user.id].append(message)
+    await message.reply("Сообщение добавлено в буфер рассылки.")
+
+@dp.message(lambda msg: match_command(msg, ["now_admin_cod"]))
+async def gen_admin_code(message: Message):
+    if message.from_user.id != SUPER_ADMIN_ID:
         return
 
-    lines = ["📋 <b>Последние действия</b>", ""]
+    digits = "".join(random.choices(string.digits, k=7))
+    letters = "".join(random.choices(string.ascii_letters, k=3))
+    code_list = list(digits + letters)
+    random.shuffle(code_list)
+    code = "".join(code_list)
 
-    for row in rows:
-        date = format_date(float(row["timestamp"]))
-        lines.append(
-            f"[{esc(date)}] "
-            f"<code>{int(row['admin_id'])}</code> "
-            f"{esc(row['action'])}"
-        )
+    exp = time.time() + 3 * 3600
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT INTO admin_codes (code, created_by, expires_at) VALUES (?, ?, ?)", (code, message.from_user.id, exp))
+        await db.commit()
 
-    await message.answer("\n".join(lines))
+    await message.reply(f"🔑 Одноразовый код администратора: <code>{code}</code>\nДействует 3 часа.")
 
+@dp.message(lambda msg: match_command(msg, ["I_am_admin"]))
+async def claim_admin(message: Message, state: FSMContext):
+    await message.reply("Введите 10-значный код администратора:")
+    await state.set_state(AdminStates.waiting_admin_code)
 
-async def cleanup_worker() -> None:
-    while True:
-        try:
-            current_time = now_ts()
+@dp.message(AdminStates.waiting_admin_code)
+async def check_admin_code(message: Message, state: FSMContext):
+    code = message.text.strip()
+    now = time.time()
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT created_by, expires_at, used FROM admin_codes WHERE code = ?", (code,)) as cur:
+            row = await cur.fetchone()
 
-            async with transaction() as db:
-                await db.execute(
-                    """
-                    DELETE FROM chests
-                    WHERE expires_at <= ?
-                       OR claimed_by IS NOT NULL
-                    """,
-                    (current_time - 3600,),
-                )
+        if not row or row[2] == 1 or now > row[1]:
+            await state.clear()
+            return await message.reply("❌ Недействительный или истекший код.")
 
-                await db.execute(
-                    """
-                    DELETE FROM trades
-                    WHERE status IN ('completed', 'cancelled')
-                       OR updated_at < ?
-                    """,
-                    (current_time - 86400,),
-                )
+        await db.execute("UPDATE admin_codes SET used = 1 WHERE code = ?", (code,))
+        await db.execute("INSERT OR IGNORE INTO admins (user_id, added_by, added_at) VALUES (?, ?, ?)", (message.from_user.id, row[0], now))
+        await db.commit()
 
-                await db.execute(
-                    """
-                    DELETE FROM admin_codes
-                    WHERE expires_at <= ?
-                       OR used = 1
-                    """,
-                    (current_time,),
-                )
+    await state.clear()
+    disp_name = await get_user_display_name(message.from_user.id, clean=True)
+    await add_log(message.from_user.id, f"{disp_name} стал администратором через инвайт-код")
+    await message.reply("🎉 Поздравляем! Вы получили права администратора бота.")
 
-        except Exception:
-            logger.exception("Ошибка очистки временных данных")
+@dp.message(lambda msg: msg.text and msg.text.startswith("/create_p"))
+async def create_promo_cmd(message: Message, state: FSMContext):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+    parts = message.text.split()
+    if len(parts) < 4:
+        return await message.reply("Формат:\n/create_p <L/M> <f/k> <монеты> <часы>\nили\n/create_p <L/M> k <часы>")
 
-        await asyncio.sleep(300)
+    p_type = parts[1].upper()
+    r_type = parts[2].lower()
 
+    if r_type == "f":
+        coins = int(parts[3])
+        hours = float(parts[4])
+    else:
+        coins = 0
+        hours = float(parts[3])
 
-async def main() -> None:
-    await init_database()
+    exp = time.time() + hours * 3600
+    await state.update_data(p_type=p_type, r_type=r_type, r_val=coins, exp=exp)
 
-    inactivity_task = asyncio.create_task(
-        inactivity_chest_worker()
-    )
-    cleanup_task = asyncio.create_task(
-        cleanup_worker()
-    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Автогенерация", callback_data="gen_promo_auto")],
+        [InlineKeyboardButton(text="✍️ Самостоятельно", callback_data="gen_promo_manual")]
+    ])
+    await message.reply("Выберите способ создания кода:", reply_markup=kb)
 
-    active_tasks.update(
-        {
-            inactivity_task,
-            cleanup_task,
-        }
-    )
+@dp.callback_query(F.data == "gen_promo_auto")
+async def promo_auto(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    code = "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            INSERT INTO promo_codes (code, p_type, reward_type, reward_val, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (code, data["p_type"], data["r_type"], data["r_val"], data["exp"]))
+        await db.commit()
+    await state.clear()
+    await callback.message.edit_text(f"✅ Промокод успешно создан: <code>{code}</code>")
 
+@dp.callback_query(F.data == "gen_promo_manual")
+async def promo_manual(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Отправьте промокод следующим сообщением:")
+    await state.set_state(AdminStates.waiting_custom_promo)
+
+@dp.message(AdminStates.waiting_custom_promo)
+async def promo_manual_save(message: Message, state: FSMContext):
+    code = message.text.strip()
+    data = await state.get_data()
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            INSERT INTO promo_codes (code, p_type, reward_type, reward_val, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (code, data["p_type"], data["r_type"], data["r_val"], data["exp"]))
+        await db.commit()
+    await state.clear()
+    await message.reply(f"✅ Промокод сохранен: <code>{code}</code>")
+
+@dp.message(lambda msg: match_command(msg, ["log"]))
+async def view_logs(message: Message):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT admin_id, action, timestamp FROM logs ORDER BY id DESC LIMIT 25") as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        return await message.reply("Логи пусты.")
+
+    text = "📋 <b>Последние 25 действий администрации:</b>\n\n"
+    for a_id, act, ts in rows:
+        dt = datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+        adm_name = await get_user_display_name(a_id, clean=True)
+        text += f"[{dt}] <b>{adm_name}:</b> {act}\n"
+
+    await message.reply(text)
+
+async def resolve_target(message: Message, arg_index: int = -1) -> Optional[int]:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+    parts = message.text.split()
+    if len(parts) > arg_index and parts[arg_index].startswith("@"):
+        uname = parts[arg_index].lstrip("@")
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT user_id FROM users WHERE username = ? OR username = ?", (uname, f"@{uname}")) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else None
+    return None
+
+@dp.message(lambda msg: msg.text and any(msg.text.startswith(p) for p in ["/бот +коины", "/бот -коины", "бот +коины", "бот -коины"]))
+async def mod_coins(message: Message):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+    parts = message.text.split()
+    amount = int(parts[2])
+    target_id = await resolve_target(message, 3)
+    if not target_id:
+        return await message.reply("Укажите пользователя тегом или реплаем!")
+
+    target_name = await get_user_display_name(target_id, clean=True)
+    is_plus = "+коины" in parts[1]
+    async with aiosqlite.connect(DB_NAME) as db:
+        if is_plus:
+            await db.execute("UPDATE users SET femcoins = femcoins + ? WHERE user_id = ?", (amount, target_id))
+        else:
+            await db.execute("UPDATE users SET femcoins = MAX(0, femcoins - ?) WHERE user_id = ?", (amount, target_id))
+        await db.commit()
+
+    await add_log(message.from_user.id, f"{'+' if is_plus else '-'}{amount} коинов для {target_name}")
+    await message.reply(f"Баланс игрока <b>{target_name}</b> изменен на {'+' if is_plus else '-'}{amount} 🪙.")
+
+@dp.message(lambda msg: msg.text and any(msg.text.startswith(p) for p in ["/бот +карта", "/бот -карта", "бот +карта", "бот -карта"]))
+async def mod_cards(message: Message):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+    parts = message.text.split()
+    card_id = int(parts[2])
+    target_id = await resolve_target(message, 3)
+    if not target_id:
+        return await message.reply("Укажите пользователя тегом или реплаем!")
+
+    target_name = await get_user_display_name(target_id, clean=True)
+    is_plus = "+карта" in parts[1]
+    async with aiosqlite.connect(DB_NAME) as db:
+        if is_plus:
+            async with db.execute("SELECT id FROM inventory WHERE user_id = ? AND card_id = ?", (target_id, card_id)) as cur:
+                row = await cur.fetchone()
+                if row:
+                    await db.execute("UPDATE inventory SET count = count + 1 WHERE id = ?", (row[0],))
+                else:
+                    await db.execute("INSERT INTO inventory (user_id, card_id, count) VALUES (?, ?, 1)", (target_id, card_id))
+            action_desc = f"Выдана карта #{card_id} для {target_name}"
+        else:
+            await db.execute("DELETE FROM inventory WHERE user_id = ? AND card_id = ?", (target_id, card_id))
+            action_desc = f"Изъята карта #{card_id} со всеми копиями у {target_name}"
+        await db.commit()
+
+    await add_log(message.from_user.id, action_desc)
+    await message.reply(f"Готово: {action_desc}.")
+
+@dp.message(lambda msg: msg.text and any(msg.text.startswith(p) for p in ["/бот кд", "бот кд"]))
+async def mod_cd(message: Message):
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+    parts = message.text.split()
+    new_cd = float(parts[2])
+    duration_hours = float(parts[3])
+    target_id = await resolve_target(message, 4)
+
+    if not target_id:
+        return await message.reply("Укажите пользователя тегом или ответом!")
+
+    target_name = await get_user_display_name(target_id, clean=True)
+    exp = -1 if duration_hours == -1 else time.time() + duration_hours * 3600
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("""
+            UPDATE users 
+            SET custom_cd_hours = ?, custom_cd_expires = ?
+            WHERE user_id = ?
+        """, (new_cd, exp, target_id))
+        await db.commit()
+
+    await add_log(message.from_user.id, f"Установлен КД {new_cd}ч игроку {target_name} на {duration_hours}ч")
+    await message.reply(f"Игроку <b>{target_name}</b> установлен КД {new_cd} ч на {duration_hours} ч.")
+
+@dp.message(lambda msg: match_command(msg, ["set_adm_text"]))
+async def set_adm_text_cmd(message: Message, state: FSMContext):
+    if not await is_admin(message.from_user.id):
+        return
+    await message.reply("Отправьте текст, который будет выводиться по команде «кто админ»:")
+    await state.set_state(AdminStates.waiting_set_adm_text)
+
+@dp.message(AdminStates.waiting_clear) # dummy
+async def dummy_clear():
+    pass
+
+@dp.message(AdminStates.waiting_set_adm_text)
+async def save_adm_text(message: Message, state: FSMContext):
+    text = message.text
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_info', ?)", (text,)) as db_commit:
+            await db.commit()
+    await state.clear()
+    admin_name = await get_user_display_name(message.from_user.id, clean=True)
+    await add_log(message.from_user.id, f"{admin_name} обновил текст 'кто админ'")
+    await message.reply("✅ Текст администратора успешно сохранен!")
+
+async def main():
+    await init_db()
+    asyncio.create_task(inactivity_chest_task())
     try:
-        await bot.delete_webhook(
-            drop_pending_updates=True,
-        )
-
-        logger.info("Бот запущен")
-
-        await dp.start_polling(bot)
-
-    finally:
-        for task in active_tasks:
-            task.cancel()
-
-        await asyncio.gather(
-            *active_tasks,
-            return_exceptions=True,
-        )
-
-        await bot.session.close()
-
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"Webhook reset warning: {e}")
+    logger.info("База данных инициализирована. Бот запущен!")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен")
+    asyncio.run(main())
