@@ -1129,8 +1129,9 @@ async def get_profile_text(
     async with db_connection() as db:
         async with db.execute(
             """
-            SELECT femcoins, vip_until, cd_resets_count,
-                   cd_reset_expires, attack_block_until
+            SELECT femcoins, vip_until,
+                   cd_resets_count, cd_reset_expires,
+                   attack_block_until
             FROM users
             WHERE user_id = ?
             """,
@@ -1156,10 +1157,7 @@ async def get_profile_text(
             cards = await cursor.fetchone()
 
         async with db.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM cards
-            """
+            "SELECT COUNT(*) AS total FROM cards"
         ) as cursor:
             card_total = await cursor.fetchone()
 
@@ -1171,14 +1169,15 @@ async def get_profile_text(
             FROM artifacts
             WHERE user_id = ?
             GROUP BY artifact_type, subtype
-            """
+            """,
+            (user_id,),
         ) as cursor:
             artifact_rows = await cursor.fetchall()
 
     lines = [
         "👤 <b>Профиль игрока</b>",
         "",
-        f"💰 Баланс: <b>{int(user['femcoins'])} 🪙</b>",
+        f"💰 Баланс: <b>{int(user['femcoins'] or 0)} 🪙</b>",
     ]
 
     vip_until = float(user["vip_until"] or 0)
@@ -1190,22 +1189,22 @@ async def get_profile_text(
 
     unique_cards = int(cards["unique_cards"] or 0)
     total_cards = int(cards["total_cards"] or 0)
-    total_available = int(card_total["total"] or 0)
+    available_cards = int(card_total["total"] or 0)
 
     if unique_cards:
         lines.append(
             f"🎴 Собранные карты: "
-            f"<b>{unique_cards}/{total_available}</b> "
+            f"<b>{unique_cards}/{available_cards}</b> "
             f"(копий: {total_cards})"
         )
 
     skip_count = int(user["cd_resets_count"] or 0)
     skip_expires = float(user["cd_reset_expires"] or 0)
 
-    if skip_count and skip_expires > current_time:
+    if skip_count > 0 and skip_expires > current_time:
         lines.append(
             f"⚡ Скипы: <b>{skip_count}</b> "
-            f"(ещё {short_time(skip_expires - current_time)})"
+            f"(осталось {short_time(skip_expires - current_time)})"
         )
 
     blades = 0
@@ -1216,6 +1215,9 @@ async def get_profile_text(
         artifact_type = str(row["artifact_type"])
         subtype = str(row["subtype"] or "")
         amount = int(row["amount"] or 0)
+
+        if amount <= 0:
+            continue
 
         if artifact_type == "blade":
             blades += amount
@@ -1236,20 +1238,24 @@ async def get_profile_text(
         "femboy": "фембойских",
     }
 
-    shield_parts = [
-        f"{shield_names.get(kind, kind)}: {amount}"
-        for kind, amount in shields.items()
-        if amount > 0
-    ]
+    shield_lines = []
 
-    if shield_parts:
+    for subtype, amount in shields.items():
+        if amount > 0:
+            shield_lines.append(
+                f"{shield_names.get(subtype, subtype)}: {amount}"
+            )
+
+    if shield_lines:
         lines.append(
             "🔰 Открытые щиты: <b>"
-            + ", ".join(shield_parts)
+            + ", ".join(shield_lines)
             + "</b>"
         )
 
-    attack_block_until = float(user["attack_block_until"] or 0)
+    attack_block_until = float(
+        user["attack_block_until"] or 0
+    )
 
     if attack_block_until > current_time:
         lines.append(
@@ -1269,8 +1275,6 @@ async def get_profile_text(
     )
 
     return "\n".join(lines), keyboard
-
-
 @router.message(
     lambda message: command_is(
         message,
