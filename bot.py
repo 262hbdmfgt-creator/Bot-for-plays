@@ -2426,12 +2426,12 @@ async def mod_cd(message: Message):
     target_name = await get_user_display_name(target_id, clean=True)
     exp = -1 if duration_hours == -1 else time.time() + duration_hours * 3600
     async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("""
-            UPDATE users 
-            SET custom_cd_hours = ?, custom_cd_expires = ?
-            WHERE user_id = ?
-        """, (new_cd, exp, target_id))
+        await db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('admin_info', ?)",
+            (text,)
+        )
         await db.commit()
+
 
     await add_log(message.from_user.id, f"Установлен КД {new_cd}ч игроку {target_name} на {duration_hours}ч")
     await message.reply(f"Игроку <b>{target_name}</b> установлен КД {new_cd} ч на {duration_hours} ч.")
