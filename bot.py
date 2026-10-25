@@ -274,7 +274,25 @@ async def safe_callback_answer(
     show_alert: bool = False,
 ) -> None:
     try:
-        await callback.answer(text or "", show_alert=show_alert)
+        await callback.answer(
+            text or "",
+            show_alert=show_alert,
+        )
+    except TelegramBadRequest as exc:
+        error = str(exc).lower()
+
+        if (
+            "query is too old" in error
+            or "query id is invalid" in error
+            or "response timeout expired" in error
+        ):
+            return
+
+        logger.warning(
+            "Ошибка callback.answer: %s",
+            exc,
+        )
+
     except Exception:
         logger.exception("Ошибка callback.answer")
 
