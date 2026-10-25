@@ -238,12 +238,35 @@ def normalize_command(text: Optional[str]) -> str:
 
 
 def command_is(message: Message, *aliases: str) -> bool:
-    command = normalize_command(message.text)
-    normalized = {
-        alias.lower() if alias.startswith("/") else f"/{alias.lower()}"
-        for alias in aliases
-    }
-    return command in normalized
+    if not message.text:
+        return False
+
+    text = message.text.strip().lower()
+    first_word = text.split(maxsplit=1)[0]
+
+    if "@" in first_word:
+        first_word = first_word.split("@", 1)[0]
+
+    for alias in aliases:
+        alias = alias.strip().lower()
+
+        # Полные команды из нескольких слов:
+        if " " in alias:
+            if text == alias or text == f"/{alias}":
+                return True
+            continue
+
+        # Обычные команды с аргументами:
+        variants = {
+            alias,
+            f"/{alias.lstrip('/')}",
+        }
+
+        if first_word in variants:
+            return True
+
+    return False
+
 
 
 def parse_callback(callback_data: str, prefix: str) -> Optional[str]:
