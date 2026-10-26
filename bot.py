@@ -5766,6 +5766,931 @@ async def main() -> None:
         await bot.session.close()
 
 
+broadcast_buffer: dict[int, list[Message]] = {}
+
+
+def admin_reply_target(message: Message) -> Optional[int]:
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+    return None
+
+
+def rarity_keyboard(prefix: str = "admin_rarity:") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=rarity,
+                    callback_data=f"{prefix}{index}",
+                )
+            ]
+            for index, rarity in enumerate(RARITIES)
+        ]
+    )
+
+
+@router.message(
+    lambda message: command_is(message, "plus_foto")
+)
+async def plus_foto_command(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+
+    await state.clear()
+    await state.set_state(AdminStates.waiting_photo)
+
+    await message.answer(
+        "📸 <b>Добавление карты</b>\n\n"
+        "Отправьте фотографию новой карты."
+    )
+
+
+@router.message(AdminStates.waiting_photo, F.photo)
+async def admin_photo_received(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.update_data(
+        file_id=message.photo[-1].file_id,
+    )
+
+    await state.set_state(AdminStates.waiting_card_description)
+
+    await message.answer(
+        "🌈 Выберите редкость карты:",
+        reply_markup=rarity_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_rarity:"))
+async def admin_rarity_selected(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    try:
+        index = int(
+            parse_callback(
+                callback.data or "",
+                "admin_rarity:",
+            )
+        )
+        rarity = RARITIES[index]
+    except (ValueError, TypeError, IndexError):
+        await safe_callback_answer(
+            callback,
+            "Некорректная редкость",
+            show_alert=True,
+        )
+        return
+
+    await state.update_data(rarity=rarity)
+
+    await safe_edit_text(
+        callback.message,
+        f"🏷 Выбрана редкость: <b>{esc(rarity)}</b>\n\n"
+        "Теперь отправьте описание карты текстом.",
+    )
+
+    await safe_callback_answer(callback)
+
+
+@router.message(AdminStates.waiting_card_description)
+async def admin_description_received(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if not message.text:
+        await message.answer("❌ Описание должно быть текстом.")
+        return
+
+    data = await state.get_data()
+
+    if not data.get("file_id") or not data.get("rarity"):
+        await state.clear()
+        await message.answer("❌ Сессия добавления карты сброшена.")
+        return
+
+    async with transaction() as db:
+        cursor = await db.execute(
+            """
+            INSERT INTO cards(file_id, rarity, description)
+            VALUES (?, ?, ?)
+            """,
+            (
+                data["file_id"],
+                data["rarity"],
+                message.text.strip(),
+            ),
+        )
+        card_id = cursor.lastrowid
+
+    await log_action(
+        message.from_user.id,
+        f"Добавлена карта #{card_id}, редкость {data['rarity']}",
+    )
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Карта добавлена!</b>\n\n"
+        f"🎴 ID: <b>#{card_id}</b>\n"
+        f"🏷 Редкость: <b>{esc(data['rarity'])}</b>"
+    )
+
+
+@router.message(
+    lambda message: (
+        message.text
+        and message.text.lower().strip()
+        in {"all card", "100 card"}
+    )
+)
+async def cards_album_command(message: Message) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+
+    limit = 100 if message.text.lower().strip() == "100 card" else 500
+
+    async with db_connection() as db:
+        async with db.execute(
+            """
+            SELECT id, file_id, rarity, description
+            FROM cards
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ) as cursor:
+            cards = await cursor.fetchall()
+
+    if not cards:
+        await message.answer("🎴 Библиотека карт пуста.")
+        return
+
+    await message.answer(
+        f"🎴 <b>Библиотека карт</b>\n"
+        f"Показано: <b>{len(cards)}</b>"
+    )
+
+    for card in cards:
+        caption = (
+            f"🎴 <b>Карта #{int(card['id'])}</b>\n"
+            f"🏷 {esc(card['rarity'])}\n"
+            f"📝 {esc(card['description']) or 'Без описания'}"
+        )
+
+        try:
+            await message.answer_photo(
+                card["file_id"],
+                caption=caption,
+            )
+        except Exception:
+            logger.exception(
+                "Ошибка отправки карты #%s",
+                card["id"],
+            )
+
+        await asyncio.sleep(0.05)
+
+
+@router.message(
+    lambda message: (
+        message.text
+        and re.match(
+            r"^/?card\s+\d+$",
+            message.text.strip(),
+            re.IGNORECASE,
+        )
+    )
+)
+async def card_admin_command(message: Message) -> None:
+    if not await is_admin(message.from_user.id):
+        return
+
+    try:
+        card_id = int(message.text.split()[1])
+    except (IndexError, ValueError):
+        await message.answer("Формат: <code>/card 15</code>")
+        return
+
+    async with db_connection() as db:
+        async with db.execute(
+            """
+            SELECT id, file_id, rarity, description
+            FROM cards
+            WHERE id = ?
+            """,
+            (card_id,),
+        ) as cursor:
+            card = await cursor.fetchone()
+
+        if not card:
+            await message.answer("❌ Карта не найдена.")
+            return
+
+        async with db.execute(
+            """
+            SELECT COUNT(DISTINCT user_id) AS owners,
+                   COALESCE(SUM(count), 0) AS copies
+            FROM inventory
+            WHERE card_id = ?
+            """,
+            (card_id,),
+        ) as cursor:
+            stats = await cursor.fetchone()
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить карту",
+                    callback_data=f"admin_delete_card:{card_id}",
+                )
+            ]
+        ]
+    )
+
+    caption = (
+        f"🎴 <b>Карта #{card_id}</b>\n\n"
+        f"🏷 Редкость: <b>{esc(card['rarity'])}</b>\n"
+        f"📝 {esc(card['description']) or 'Без описания'}\n\n"
+        f"👥 Владельцев: <b>{int(stats['owners'] or 0)}</b>\n"
+        f"📦 Копий: <b>{int(stats['copies'] or 0)}</b>"
+    )
+
+    await message.answer_photo(
+        card["file_id"],
+        caption=caption,
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("admin_delete_card:"))
+async def admin_delete_card_callback(
+    callback: CallbackQuery,
+) -> None:
+    if not await is_admin(callback.from_user.id):
+        await safe_callback_answer(
+            callback,
+            "Нет прав",
+            show_alert=True,
+        )
+        return
+
+    try:
+        card_id = int(
+            parse_callback(
+                callback.data or "",
+                "admin_delete_card:",
+            )
+        )
+    except (ValueError, TypeError):
+        await safe_callback_answer(
+            callback,
+            "Некорректный ID",
+            show_alert=True,
+        )
+        return
+
+    async with transaction() as db:
+        await db.execute(
+            "DELETE FROM inventory WHERE card_id = ?",
+            (card_id,),
+        )
+        result = await db.execute(
+            "DELETE FROM cards WHERE id = ?",
+            (card_id,),
+        )
+
+        if result.rowcount == 0:
+            await safe_callback_answer(
+                callback,
+                "Карта уже удалена",
+                show_alert=True,
+            )
+            return
+
+    await log_action(
+        callback.from_user.id,
+        f"Удалена карта #{card_id} без сдвига ID",
+    )
+
+    await safe_edit_text(
+        callback.message,
+        f"🗑 Карта <b>#{card_id}</b> удалена.\n"
+        "ID остальных карт не изменены.",
+    )
+
+    await safe_callback_answer(callback)
+
+
+@router.message(
+    lambda message: command_is(message, "admins")
+)
+async def admins_command(message: Message) -> None:
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+
+    async with db_connection() as db:
+        async with db.execute(
+            """
+            SELECT user_id, added_at
+            FROM admins
+            ORDER BY added_at
+            """
+        ) as cursor:
+            admins = await cursor.fetchall()
+
+    if not admins:
+        await message.answer("👑 Дополнительных администраторов нет.")
+        return
+
+    buttons = []
+
+    for row in admins:
+        uid = int(row["user_id"])
+        name = await get_username_from_db(uid)
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"❌ Снять {name}",
+                    callback_data=f"remove_admin:{uid}",
+                )
+            ]
+        )
+
+    await message.answer(
+        "👑 <b>Администраторы бота</b>",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("remove_admin:"))
+async def remove_admin_callback(
+    callback: CallbackQuery,
+) -> None:
+    if callback.from_user.id != SUPER_ADMIN_ID:
+        await safe_callback_answer(
+            callback,
+            "Только супер-администратор",
+            show_alert=True,
+        )
+        return
+
+    try:
+        user_id = int(
+            parse_callback(
+                callback.data or "",
+                "remove_admin:",
+            )
+        )
+    except (ValueError, TypeError):
+        await safe_callback_answer(
+            callback,
+            "Некорректный ID",
+            show_alert=True,
+        )
+        return
+
+    async with transaction() as db:
+        await db.execute(
+            "DELETE FROM admins WHERE user_id = ?",
+            (user_id,),
+        )
+
+    await log_action(
+        callback.from_user.id,
+        f"Снят администратор {user_id}",
+    )
+
+    await safe_callback_answer(
+        callback,
+        "Администратор снят",
+        show_alert=True,
+    )
+
+    await admins_command(callback.message)
+
+
+@router.message(
+    lambda message: command_is(message, "now_admin_cod")
+)
+async def create_admin_code_command(message: Message) -> None:
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+
+    code = secrets.token_urlsafe(8).upper()
+    expires = now_ts() + 3 * 3600
+
+    async with transaction() as db:
+        await db.execute(
+            """
+            INSERT INTO admin_codes(
+                code, created_by, expires_at, used
+            )
+            VALUES (?, ?, ?, 0)
+            """,
+            (code, message.from_user.id, expires),
+        )
+
+    await message.answer(
+        "🔐 <b>Одноразовый код администратора</b>\n\n"
+        f"<code>{esc(code)}</code>\n"
+        "⏳ Действует 3 часа."
+    )
+
+
+@router.message(
+    lambda message: command_is(message, "I_am_admin")
+)
+async def become_admin_command(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    await state.set_state(AdminStates.waiting_admin_code)
+    await message.answer(
+        "🔐 Отправьте одноразовый код администратора."
+    )
+
+
+@router.message(AdminStates.waiting_admin_code)
+async def process_admin_code(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if not message.text:
+        return
+
+    code = message.text.strip().upper()
+
+    async with transaction() as db:
+        async with db.execute(
+            """
+            SELECT created_by, expires_at, used
+            FROM admin_codes
+            WHERE code = ?
+            """,
+            (code,),
+        ) as cursor:
+            row = await cursor.fetchone()
+
+        if (
+            not row
+            or int(row["used"]) == 1
+            or float(row["expires_at"]) <= now_ts()
+        ):
+            await state.clear()
+            await message.answer("❌ Код недействителен.")
+            return
+
+        await db.execute(
+            """
+            UPDATE admin_codes
+            SET used = 1
+            WHERE code = ?
+            """,
+            (code,),
+        )
+
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO admins(
+                user_id, added_by, added_at
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                message.from_user.id,
+                int(row["created_by"]),
+                now_ts(),
+            ),
+        )
+
+    await state.clear()
+
+    await log_action(
+        message.from_user.id,
+        "Получены права администратора",
+    )
+
+    await message.answer(
+        "🎉 Вы стали администратором бота!"
+    )
+
+
+@router.message(
+    lambda message: (
+        message.text
+        and message.text.lower().startswith("/create_p")
+    )
+)
+async def create_promo_command(message: Message) -> None:
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+
+    parts = message.text.split()
+
+    if len(parts) != 5:
+        await message.answer(
+            "Формат:\n"
+            "<code>/create_p M v 5 24</code>\n\n"
+            "M/L — тип кода;\n"
+            "f — фемкоины;\n"
+            "k — скип КД;\n"
+            "v — VIP в часах;\n"
+            "последнее число — срок действия кода в часах."
+        )
+        return
+
+    promo_type = parts[1].upper()
+    reward_type = parts[2].lower()
+
+    if promo_type not in {"M", "L"}:
+        await message.answer("Тип промокода должен быть M или L.")
+        return
+
+    if reward_type not in {"f", "k", "v"}:
+        await message.answer("Тип награды: f, k или v.")
+        return
+
+    try:
+        reward_value = int(parts[3])
+        lifetime_hours = float(parts[4])
+    except ValueError:
+        await message.answer("Значения должны быть числами.")
+        return
+
+    if reward_value <= 0 or lifetime_hours <= 0:
+        await message.answer("Значения должны быть положительными.")
+        return
+
+    code = secrets.token_urlsafe(8).upper()
+    expires_at = now_ts() + lifetime_hours * 3600
+
+    async with transaction() as db:
+        await db.execute(
+            """
+            INSERT INTO promo_codes(
+                code, p_type, reward_type,
+                reward_val, expires_at, is_used
+            )
+            VALUES (?, ?, ?, ?, ?, 0)
+            """,
+            (
+                code,
+                promo_type,
+                reward_type,
+                reward_value,
+                expires_at,
+            ),
+        )
+
+    await log_action(
+        message.from_user.id,
+        f"Создан промокод {code}",
+    )
+
+    await message.answer(
+        "✅ <b>Промокод создан</b>\n\n"
+        f"🔑 Код: <code>{esc(code)}</code>\n"
+        f"🎁 Награда: <b>{reward_value}</b>\n"
+        f"⏳ Действует: <b>{lifetime_hours:g} ч.</b>"
+    )
+
+
+@router.message(
+    lambda message: command_is(message, "log")
+)
+async def admin_log_command(message: Message) -> None:
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+
+    async with db_connection() as db:
+        async with db.execute(
+            """
+            SELECT admin_id, action, timestamp
+            FROM logs
+            ORDER BY id DESC
+            LIMIT 25
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await message.answer("📋 Логи пусты.")
+        return
+
+    lines = ["📋 <b>Последние 25 действий</b>", ""]
+
+    for row in rows:
+        lines.append(
+            f"🕒 {format_date(float(row['timestamp']))}\n"
+            f"👤 <code>{int(row['admin_id'])}</code>\n"
+            f"📝 {esc(row['action'])}\n"
+        )
+
+    await message.answer("\n".join(lines))
+
+
+@router.message(
+    lambda message: command_is(message, "top", "топ")
+)
+async def top_command(message: Message) -> None:
+    async with db_connection() as db:
+        async with db.execute(
+            """
+            SELECT u.username,
+                   u.user_id,
+                   COALESCE(SUM(i.count), 0) AS cards
+            FROM users AS u
+            LEFT JOIN inventory AS i
+                ON i.user_id = u.user_id
+            GROUP BY u.user_id
+            ORDER BY cards DESC, u.first_seen ASC
+            LIMIT 10
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    lines = ["🏆 <b>ТОП-10 КОЛЛЕКЦИОНЕРОВ</b>", ""]
+
+    for index, row in enumerate(rows, 1):
+        username = str(row["username"] or "Игрок")
+        username = username.lstrip("@").split()[0]
+
+        lines.append(
+            f"{index}. {esc(username)} — "
+            f"<b>{int(row['cards'])}</b> карт"
+        )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📜 Топ-100 в личные сообщения",
+                    callback_data="top100:send",
+                )
+            ]
+        ]
+    )
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data == "top100:send")
+async def top100_callback(
+    callback: CallbackQuery,
+) -> None:
+    async with db_connection() as db:
+        async with db.execute(
+            """
+            SELECT username,
+                   COALESCE(SUM(inventory.count), 0) AS cards
+            FROM users
+            LEFT JOIN inventory
+                ON inventory.user_id = users.user_id
+            GROUP BY users.user_id
+            ORDER BY cards DESC, users.first_seen ASC
+            LIMIT 100
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    lines = ["📜 <b>ТОП-100 КОЛЛЕКЦИОНЕРОВ</b>", ""]
+
+    for index, row in enumerate(rows, 1):
+        username = str(row["username"] or "Игрок")
+        username = username.lstrip("@").split()[0]
+
+        lines.append(
+            f"{index}. {esc(username)} — "
+            f"{int(row['cards'])} карт"
+        )
+
+    try:
+        await bot.send_message(
+            callback.from_user.id,
+            "\n".join(lines),
+        )
+        await safe_callback_answer(
+            callback,
+            "Топ-100 отправлен в личные сообщения",
+            show_alert=True,
+        )
+    except Exception:
+        logger.exception("Ошибка отправки топ-100")
+        await safe_callback_answer(
+            callback,
+            "Сначала откройте личные сообщения с ботом",
+            show_alert=True,
+        )
+
+
+def parse_admin_artifact_command(
+    message: Message,
+) -> Optional[tuple[str, int, str]]:
+    if not message.text:
+        return None
+
+    parts = message.text.lower().split()
+
+    if len(parts) < 3:
+        return None
+
+    operation = parts[1]
+
+    if operation not in {
+        "+клинок",
+        "-клинок",
+        "+броня",
+        "-броня",
+        "+щит",
+        "-щит",
+    }:
+        return None
+
+    try:
+        amount = int(parts[-1])
+    except ValueError:
+        return None
+
+    if amount <= 0:
+        return None
+
+    subtype = "weak"
+
+    if operation in {"+щит", "-щит"} and len(parts) >= 4:
+        subtype = parts[2]
+
+    return operation, amount, subtype
+
+
+@router.message(
+    lambda message: (
+        message.text
+        and message.text.lower().startswith(("бот ", "/бот "))
+        and any(
+            item in message.text.lower()
+            for item in (
+                "+клинок",
+                "-клинок",
+                "+броня",
+                "-броня",
+                "+щит",
+                "-щит",
+            )
+        )
+    )
+)
+async def admin_artifact_command(message: Message) -> None:
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+
+    parsed = parse_admin_artifact_command(message)
+    target_id = admin_reply_target(message)
+
+    if not parsed or not target_id:
+        await message.answer(
+            "Формат: ответом на сообщение пользователя\n"
+            "<code>/бот +клинок 1</code>\n"
+            "<code>/бот +щит weak 4</code>\n"
+            "<code>/бот +броня 2</code>"
+        )
+        return
+
+    operation, amount, subtype = parsed
+    await ensure_user(message.reply_to_message.from_user)
+
+    if "клинок" in operation:
+        artifact_type = "blade"
+        subtype = ""
+    elif "броня" in operation:
+        artifact_type = "armor"
+        subtype = ""
+    else:
+        artifact_type = "shield"
+
+        if subtype not in {"weak", "reinforced", "femboy"}:
+            await message.answer(
+                "Тип щита: weak, reinforced или femboy."
+            )
+            return
+
+    is_add = operation.startswith("+")
+
+    async with transaction() as db:
+        if is_add:
+            await add_artifact(
+                db,
+                target_id,
+                artifact_type,
+                subtype,
+                amount,
+            )
+        else:
+            result = await db.execute(
+                """
+                UPDATE artifacts
+                SET amount = amount - ?
+                WHERE user_id = ?
+                  AND artifact_type = ?
+                  AND subtype = ?
+                  AND amount >= ?
+                """,
+                (
+                    amount,
+                    target_id,
+                    artifact_type,
+                    subtype,
+                    amount,
+                ),
+            )
+
+            if result.rowcount != 1:
+                await message.answer(
+                    "❌ У пользователя недостаточно предметов."
+                )
+                return
+
+    await log_action(
+        message.from_user.id,
+        f"{operation} {amount} для пользователя {target_id}",
+    )
+
+    await message.answer(
+        "✅ Артефактная операция выполнена."
+    )
+
+
+@router.message(
+    lambda message: (
+        message.text
+        and message.text.lower().startswith(("бот ", "/бот "))
+        and (
+            "+коины" in message.text.lower()
+            or "-коины" in message.text.lower()
+        )
+    )
+)
+async def admin_coins_extra_command(message: Message) -> None:
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+
+    parts = message.text.split()
+    target_id = admin_reply_target(message)
+
+    if not target_id or len(parts) < 3:
+        await message.answer(
+            "Используйте команду ответом:\n"
+            "<code>/бот +коины 100</code>"
+        )
+        return
+
+    try:
+        amount = int(parts[-1])
+    except ValueError:
+        await message.answer("Сумма должна быть числом.")
+        return
+
+    if amount < 0:
+        await message.answer("Сумма не может быть отрицательной.")
+        return
+
+    is_add = "+коины" in message.text.lower()
+
+    async with transaction() as db:
+        if is_add:
+            await db.execute(
+                """
+                UPDATE users
+                SET femcoins = femcoins + ?
+                WHERE user_id = ?
+                """,
+                (amount, target_id),
+            )
+        else:
+            await db.execute(
+                """
+                UPDATE users
+                SET femcoins = MAX(0, femcoins - ?)
+                WHERE user_id = ?
+                """,
+                (amount, target_id),
+            )
+
+    await message.answer("✅ Баланс изменён.")
+
+
+# Финальный запуск должен быть самым последним кодом файла.
 if __name__ == "__main__":
     try:
         asyncio.run(main())
