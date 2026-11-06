@@ -5898,7 +5898,7 @@ async def get_profile_text(
     )
 
     return "\n".join(lines), keyboard
-
+    
 if __name__ == "__main__":
     try:
         asyncio.run(main())
